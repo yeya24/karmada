@@ -1,22 +1,30 @@
+/*
+Copyright 2020 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package util
 
 import (
-	"k8s.io/apimachinery/pkg/runtime"
+	"time"
+
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
-	"github.com/karmada-io/karmada/pkg/util/ratelimiter"
-)
-
-const (
-	// maxRetries is the number of times a resource will be retried before it is dropped out of the queue.
-	// With the current rate-limiter in use (5ms*2^(maxRetries-1)) the following numbers represent the times
-	// a resource is going to be re-queued:
-	//
-	// 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1.3s, 2.6s, 5.1s, 10.2s, 20.4s, 41s, 82s
-	maxRetries = 15
+	"github.com/karmada-io/karmada/pkg/sharedcli/ratelimiterflag"
 )
 
 // AsyncWorker maintains a rate limiting queue and the items in the queue will be reconciled by a "ReconcileFunc".
@@ -26,8 +34,11 @@ type AsyncWorker interface {
 	// Add adds the 'item' to queue immediately(without any delay).
 	Add(item interface{})
 
+	// AddAfter adds an item to the workqueue after the indicated duration has passed
+	AddAfter(item interface{}, duration time.Duration)
+
 	// Enqueue generates the key of 'obj' according to a 'KeyFunc' then adds the key as an item to queue by 'Add'.
-	Enqueue(obj runtime.Object)
+	Enqueue(obj interface{})
 
 	// Run starts a certain number of concurrent workers to reconcile the items and will never stop until 'stopChan'
 	// is closed.
@@ -54,7 +65,7 @@ type asyncWorker struct {
 	// reconcileFunc is the function that process keys from the queue.
 	reconcileFunc ReconcileFunc
 	// queue allowing parallel processing of resources.
-	queue workqueue.RateLimitingInterface
+	queue workqueue.TypedRateLimitingInterface[any]
 }
 
 // Options are the arguments for creating a new AsyncWorker.
@@ -64,7 +75,7 @@ type Options struct {
 	Name               string
 	KeyFunc            KeyFunc
 	ReconcileFunc      ReconcileFunc
-	RateLimiterOptions ratelimiter.Options
+	RateLimiterOptions ratelimiterflag.Options
 }
 
 // NewAsyncWorker returns a asyncWorker which can process resource periodic.
@@ -72,14 +83,16 @@ func NewAsyncWorker(opt Options) AsyncWorker {
 	return &asyncWorker{
 		keyFunc:       opt.KeyFunc,
 		reconcileFunc: opt.ReconcileFunc,
-		queue:         workqueue.NewNamedRateLimitingQueue(ratelimiter.DefaultControllerRateLimiter(opt.RateLimiterOptions), opt.Name),
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(ratelimiterflag.DefaultControllerRateLimiter[any](opt.RateLimiterOptions), workqueue.TypedRateLimitingQueueConfig[any]{
+			Name: opt.Name,
+		}),
 	}
 }
 
-func (w *asyncWorker) Enqueue(obj runtime.Object) {
+func (w *asyncWorker) Enqueue(obj interface{}) {
 	key, err := w.keyFunc(obj)
 	if err != nil {
-		klog.Warningf("Failed to generate key for obj: %s", obj.GetObjectKind().GroupVersionKind())
+		klog.Errorf("Failed to generate key for obj: %+v, err: %v", obj, err)
 		return
 	}
 
@@ -99,19 +112,13 @@ func (w *asyncWorker) Add(item interface{}) {
 	w.queue.Add(item)
 }
 
-func (w *asyncWorker) handleError(err error, key interface{}) {
-	if err == nil {
-		w.queue.Forget(key)
+func (w *asyncWorker) AddAfter(item interface{}, duration time.Duration) {
+	if item == nil {
+		klog.Warningf("Ignore nil item from queue")
 		return
 	}
 
-	if w.queue.NumRequeues(key) < maxRetries {
-		w.queue.AddRateLimited(key)
-		return
-	}
-
-	klog.V(2).Infof("Dropping resource %q out of the queue: %v", key, err)
-	w.queue.Forget(key)
+	w.queue.AddAfter(item, duration)
 }
 
 func (w *asyncWorker) worker() {
@@ -122,7 +129,12 @@ func (w *asyncWorker) worker() {
 	defer w.queue.Done(key)
 
 	err := w.reconcileFunc(key)
-	w.handleError(err, key)
+	if err != nil {
+		w.queue.AddRateLimited(key)
+		return
+	}
+
+	w.queue.Forget(key)
 }
 
 func (w *asyncWorker) Run(workerNumber int, stopChan <-chan struct{}) {

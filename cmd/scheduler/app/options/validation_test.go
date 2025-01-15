@@ -1,3 +1,19 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package options
 
 import (
@@ -9,40 +25,46 @@ import (
 	componentbaseconfig "k8s.io/component-base/config"
 )
 
+// a callback function to modify options
+type ModifyOptions func(option *Options)
+
+// New an Options with default parameters
+func New(modifyOptions ModifyOptions) Options {
+	option := Options{
+		LeaderElection: componentbaseconfig.LeaderElectionConfiguration{
+			LeaderElect: false,
+		},
+		KubeAPIQPS:                40,
+		KubeAPIBurst:              30,
+		EnableSchedulerEstimator:  false,
+		SchedulerEstimatorTimeout: metav1.Duration{Duration: 1 * time.Second},
+		SchedulerEstimatorPort:    9001,
+		SchedulerName:             "default-scheduler",
+	}
+
+	if modifyOptions != nil {
+		modifyOptions(&option)
+	}
+	return option
+}
+
 func TestValidateKarmadaSchedulerConfiguration(t *testing.T) {
 	successCases := []Options{
-		{
-			LeaderElection: componentbaseconfig.LeaderElectionConfiguration{
-				LeaderElect: false,
-			},
-			BindAddress:               "127.0.0.1",
-			SecurePort:                9000,
-			KubeAPIQPS:                40,
-			KubeAPIBurst:              30,
-			EnableSchedulerEstimator:  false,
-			SchedulerEstimatorTimeout: metav1.Duration{Duration: 1 * time.Second},
-			SchedulerEstimatorPort:    9001,
-		},
-		{
-			LeaderElection: componentbaseconfig.LeaderElectionConfiguration{
+		New(nil),
+		New(func(option *Options) {
+			option.LeaderElection = componentbaseconfig.LeaderElectionConfiguration{
 				LeaderElect: true,
-			},
-			BindAddress:               "127.0.0.1",
-			SecurePort:                9000,
-			KubeAPIQPS:                40,
-			KubeAPIBurst:              30,
-			EnableSchedulerEstimator:  false,
-			SchedulerEstimatorTimeout: metav1.Duration{Duration: 1 * time.Second},
-			SchedulerEstimatorPort:    9001,
-		}, {
+			}
+		}),
+		{
 			LeaderElection: componentbaseconfig.LeaderElectionConfiguration{
 				LeaderElect: false,
 			},
-			BindAddress:  "127.0.0.1",
-			SecurePort:   9000,
-			KubeAPIQPS:   40,
-			KubeAPIBurst: 30,
-		}}
+			KubeAPIQPS:    40,
+			KubeAPIBurst:  30,
+			SchedulerName: "default-scheduler",
+		},
+	}
 
 	for _, successCase := range successCases {
 		if errs := successCase.Validate(); len(errs) != 0 {
@@ -55,65 +77,23 @@ func TestValidateKarmadaSchedulerConfiguration(t *testing.T) {
 		opt          Options
 		expectedErrs field.ErrorList
 	}{
-		"invalid BindAddress": {
-			opt: Options{
-				LeaderElection: componentbaseconfig.LeaderElectionConfiguration{
-					LeaderElect: false,
-				},
-				BindAddress:               "127.0.0.1:8080",
-				SecurePort:                9000,
-				KubeAPIQPS:                40,
-				KubeAPIBurst:              30,
-				EnableSchedulerEstimator:  false,
-				SchedulerEstimatorTimeout: metav1.Duration{Duration: 1 * time.Second},
-				SchedulerEstimatorPort:    9001,
-			},
-			expectedErrs: field.ErrorList{field.Invalid(newPath.Child("BindAddress"), "127.0.0.1:8080", "not a valid textual representation of an IP address")},
-		},
-		"invalid SecurePort": {
-			opt: Options{
-				LeaderElection: componentbaseconfig.LeaderElectionConfiguration{
-					LeaderElect: false,
-				},
-				BindAddress:               "127.0.0.1",
-				SecurePort:                90000,
-				KubeAPIQPS:                40,
-				KubeAPIBurst:              30,
-				EnableSchedulerEstimator:  false,
-				SchedulerEstimatorTimeout: metav1.Duration{Duration: 1 * time.Second},
-				SchedulerEstimatorPort:    9001,
-			},
-			expectedErrs: field.ErrorList{field.Invalid(newPath.Child("SecurePort"), 90000, "must be a valid port between 0 and 65535 inclusive")},
-		},
 		"invalid SchedulerEstimatorPort": {
-			opt: Options{
-				LeaderElection: componentbaseconfig.LeaderElectionConfiguration{
-					LeaderElect: false,
-				},
-				BindAddress:               "127.0.0.1",
-				SecurePort:                9000,
-				KubeAPIQPS:                40,
-				KubeAPIBurst:              30,
-				EnableSchedulerEstimator:  false,
-				SchedulerEstimatorTimeout: metav1.Duration{Duration: 1 * time.Second},
-				SchedulerEstimatorPort:    90000,
-			},
+			opt: New(func(option *Options) {
+				option.SchedulerEstimatorPort = 90000
+			}),
 			expectedErrs: field.ErrorList{field.Invalid(newPath.Child("SchedulerEstimatorPort"), 90000, "must be a valid port between 0 and 65535 inclusive")},
 		},
 		"invalid SchedulerEstimatorTimeout": {
-			opt: Options{
-				LeaderElection: componentbaseconfig.LeaderElectionConfiguration{
-					LeaderElect: false,
-				},
-				BindAddress:               "127.0.0.1",
-				SecurePort:                9000,
-				KubeAPIQPS:                40,
-				KubeAPIBurst:              30,
-				EnableSchedulerEstimator:  false,
-				SchedulerEstimatorTimeout: metav1.Duration{Duration: -1 * time.Second},
-				SchedulerEstimatorPort:    9000,
-			},
+			opt: New(func(option *Options) {
+				option.SchedulerEstimatorTimeout = metav1.Duration{Duration: -1 * time.Second}
+			}),
 			expectedErrs: field.ErrorList{field.Invalid(newPath.Child("SchedulerEstimatorTimeout"), metav1.Duration{Duration: -1 * time.Second}, "must be greater than or equal to 0")},
+		},
+		"invalid SchedulerName": {
+			opt: New(func(option *Options) {
+				option.SchedulerName = ""
+			}),
+			expectedErrs: field.ErrorList{field.Invalid(newPath.Child("SchedulerName"), "", "should not be empty")},
 		},
 	}
 

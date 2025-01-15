@@ -1,4 +1,18 @@
 #!/usr/bin/env bash
+# Copyright 2021 The Karmada Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 set -o errexit
 set -o nounset
 set -o pipefail
@@ -17,19 +31,21 @@ PULL_MODE_CLUSTER_NAME=${PULL_MODE_CLUSTER_NAME:-"member3"}
 
 # delete interpreter webhook example in karmada-host
 export KUBECONFIG="${MAIN_KUBECONFIG}"
-kubectl config use-context "${HOST_CLUSTER_NAME}"
-kubectl delete -f "${REPO_ROOT}"/examples/customresourceinterpreter/karmada-interpreter-webhook-example.yaml
+kubectl --context="${HOST_CLUSTER_NAME}" delete -f "${REPO_ROOT}"/examples/customresourceinterpreter/karmada-interpreter-webhook-example.yaml
+
+# uninstall metallb
+kubectl --context="${HOST_CLUSTER_NAME}" --ignore-not-found=true delete -f https://raw.githubusercontent.com/metallb/metallb/v0.13.5/config/manifests/metallb-native.yaml
+
+kubectl --context="${HOST_CLUSTER_NAME}" get configmap kube-proxy -n kube-system -o yaml | \
+sed -e "s/strictARP: true/strictARP: false/" | \
+kubectl --context="${HOST_CLUSTER_NAME}" apply -f - -n kube-system
 
 # delete interpreter workload webhook configuration
-kubectl config use-context "${KARMADA_APISERVER}"
-kubectl delete ResourceInterpreterWebhookConfiguration examples
+kubectl --context="${KARMADA_APISERVER}" delete ResourceInterpreterWebhookConfiguration examples
 
-# delete interpreter example workload CRD in karamada-apiserver and member clusters
-kubectl delete -f "${REPO_ROOT}/examples/customresourceinterpreter/apis/workload.example.io_workloads.yaml"
+# delete interpreter example workload CRD in karmada-apiserver and member clusters
+kubectl --context="${KARMADA_APISERVER}" delete -f "${REPO_ROOT}/examples/customresourceinterpreter/apis/workload.example.io_workloads.yaml"
 export KUBECONFIG="${MEMBER_CLUSTER_KUBECONFIG}"
-kubectl config use-context "${MEMBER_CLUSTER_1_NAME}"
-kubectl delete -f "${REPO_ROOT}/examples/customresourceinterpreter/apis/workload.example.io_workloads.yaml"
-kubectl config use-context "${MEMBER_CLUSTER_2_NAME}"
-kubectl delete -f "${REPO_ROOT}/examples/customresourceinterpreter/apis/workload.example.io_workloads.yaml"
-kubectl config use-context "${PULL_MODE_CLUSTER_NAME}"
-kubectl delete -f "${REPO_ROOT}/examples/customresourceinterpreter/apis/workload.example.io_workloads.yaml"
+kubectl --context="${MEMBER_CLUSTER_1_NAME}" delete -f "${REPO_ROOT}/examples/customresourceinterpreter/apis/workload.example.io_workloads.yaml"
+kubectl --context="${MEMBER_CLUSTER_2_NAME}" delete -f "${REPO_ROOT}/examples/customresourceinterpreter/apis/workload.example.io_workloads.yaml"
+kubectl --context="${PULL_MODE_CLUSTER_NAME}" delete -f "${REPO_ROOT}/examples/customresourceinterpreter/apis/workload.example.io_workloads.yaml"

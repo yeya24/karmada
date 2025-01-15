@@ -1,3 +1,19 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package v1alpha1
 
 import (
@@ -83,7 +99,12 @@ func ConvertBindingSpecToHub(src *ResourceBindingSpec, dst *workv1alpha2.Resourc
 func ConvertBindingStatusToHub(src *ResourceBindingStatus, dst *workv1alpha2.ResourceBindingStatus) {
 	dst.Conditions = src.Conditions
 	for i := range src.AggregatedStatus {
-		dst.AggregatedStatus = append(dst.AggregatedStatus, workv1alpha2.AggregatedStatusItem(src.AggregatedStatus[i]))
+		dst.AggregatedStatus = append(dst.AggregatedStatus, workv1alpha2.AggregatedStatusItem{
+			ClusterName:    src.AggregatedStatus[i].ClusterName,
+			Status:         src.AggregatedStatus[i].Status,
+			Applied:        src.AggregatedStatus[i].Applied,
+			AppliedMessage: src.AggregatedStatus[i].AppliedMessage,
+		})
 	}
 }
 
@@ -110,6 +131,11 @@ func ConvertBindingSpecFromHub(src *workv1alpha2.ResourceBindingSpec, dst *Resou
 func ConvertBindingStatusFromHub(src *workv1alpha2.ResourceBindingStatus, dst *ResourceBindingStatus) {
 	dst.Conditions = src.Conditions
 	for i := range src.AggregatedStatus {
-		dst.AggregatedStatus = append(dst.AggregatedStatus, AggregatedStatusItem(src.AggregatedStatus[i]))
+		dst.AggregatedStatus = append(dst.AggregatedStatus, AggregatedStatusItem{
+			ClusterName:    src.AggregatedStatus[i].ClusterName,
+			Status:         src.AggregatedStatus[i].Status,
+			Applied:        src.AggregatedStatus[i].Applied,
+			AppliedMessage: src.AggregatedStatus[i].AppliedMessage,
+		})
 	}
 }

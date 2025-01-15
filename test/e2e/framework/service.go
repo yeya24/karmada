@@ -1,3 +1,19 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package framework
 
 import (
@@ -5,7 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -60,10 +76,18 @@ func WaitServiceDisappearOnCluster(cluster, namespace, name string) {
 	clusterClient := GetClusterClient(cluster)
 	gomega.Expect(clusterClient).ShouldNot(gomega.BeNil())
 
-	klog.Infof("Waiting for service disappear on cluster(%s)", cluster)
+	klog.Infof("Waiting for service(%s/%s) disappear on cluster(%s)", namespace, name, cluster)
 	gomega.Eventually(func() bool {
 		_, err := clusterClient.CoreV1().Services(namespace).Get(context.TODO(), name, metav1.GetOptions{})
-		return apierrors.IsNotFound(err)
+		if err == nil {
+			return false
+		}
+		if apierrors.IsNotFound(err) {
+			return true
+		}
+
+		klog.Errorf("Failed to get service(%s/%s) on cluster(%s), err: %v", namespace, name, cluster, err)
+		return false
 	}, pollTimeout, pollInterval).Should(gomega.Equal(true))
 }
 

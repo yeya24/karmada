@@ -16,7 +16,9 @@ limitations under the License.
 
 // This code is lifted from the kubefed codebase. It's a list of functions to determine whether the provided cluster
 // object needs to be updated according to the desired object and the recorded version.
-// For reference: https://github.com/kubernetes-sigs/kubefed/blob/master/pkg/controller/util/propagatedversion.go#L30-L59
+// For reference:
+// https://github.com/kubernetes-sigs/kubefed/blob/master/pkg/controller/util/propagatedversion.go#L30-L59
+// https://github.com/kubernetes-retired/kubefed/blob/master/pkg/controller/util/meta.go#L82-L103
 
 package lifted
 
@@ -34,6 +36,8 @@ const (
 	resourceVersionPrefix = "rv:"
 )
 
+// +lifted:source=https://github.com/kubernetes-sigs/kubefed/blob/master/pkg/controller/util/propagatedversion.go#L35-L43
+
 // ObjectVersion retrieves the field type-prefixed value used for
 // determining currency of the given cluster object.
 func ObjectVersion(clusterObj *unstructured.Unstructured) string {
@@ -43,6 +47,8 @@ func ObjectVersion(clusterObj *unstructured.Unstructured) string {
 	}
 	return fmt.Sprintf("%s%s", resourceVersionPrefix, clusterObj.GetResourceVersion())
 }
+
+// +lifted:source=https://github.com/kubernetes-sigs/kubefed/blob/master/pkg/controller/util/propagatedversion.go#L45-L59
 
 // ObjectNeedsUpdate determines whether the 2 objects provided cluster
 // object needs to be updated according to the desired object and the
@@ -59,6 +65,9 @@ func ObjectNeedsUpdate(desiredObj, clusterObj *unstructured.Unstructured, record
 	// required.
 	return strings.HasPrefix(targetVersion, generationPrefix) && !objectMetaObjEquivalent(desiredObj, clusterObj)
 }
+
+// +lifted:source=https://github.com/kubernetes-retired/kubefed/blob/master/pkg/controller/util/meta.go#L82-L103
+// +lifted:changed
 
 // objectMetaObjEquivalent checks if cluster-independent, user provided data in two given ObjectMeta are equal. If in
 // the future the ObjectMeta structure is expanded then any field that is not populated

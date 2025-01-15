@@ -1,13 +1,29 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package core
 
 import (
 	"fmt"
-
-	"k8s.io/apimachinery/pkg/util/sets"
+	"sort"
 
 	clusterv1alpha1 "github.com/karmada-io/karmada/pkg/apis/cluster/v1alpha1"
 	policyv1alpha1 "github.com/karmada-io/karmada/pkg/apis/policy/v1alpha1"
 	workv1alpha2 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha2"
+	"github.com/karmada-io/karmada/pkg/scheduler/framework"
 	"github.com/karmada-io/karmada/pkg/util"
 	"github.com/karmada-io/karmada/pkg/util/helper"
 )
@@ -19,216 +35,118 @@ func (a TargetClustersList) Len() int           { return len(a) }
 func (a TargetClustersList) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a TargetClustersList) Less(i, j int) bool { return a[i].Replicas > a[j].Replicas }
 
-// divideReplicasByDynamicWeight assigns a total number of replicas to the selected clusters by the dynamic weight list.
-func divideReplicasByDynamicWeight(clusters []*clusterv1alpha1.Cluster, dynamicWeight policyv1alpha1.DynamicWeightFactor, spec *workv1alpha2.ResourceBindingSpec) ([]workv1alpha2.TargetCluster, error) {
-	switch dynamicWeight {
-	case policyv1alpha1.DynamicWeightByAvailableReplicas:
-		return divideReplicasByResource(clusters, spec, policyv1alpha1.ReplicaDivisionPreferenceWeighted)
-	default:
-		return nil, fmt.Errorf("undefined replica dynamic weight factor: %s", dynamicWeight)
-	}
-}
-
-func divideReplicasByResource(
-	clusters []*clusterv1alpha1.Cluster,
-	spec *workv1alpha2.ResourceBindingSpec,
-	preference policyv1alpha1.ReplicaDivisionPreference,
-) ([]workv1alpha2.TargetCluster, error) {
-	// Step 1: Find the ready clusters that have old replicas
-	scheduledClusters := findOutScheduledCluster(spec.Clusters, clusters)
-
-	// Step 2: calculate the assigned Replicas in scheduledClusters
-	assignedReplicas := util.GetSumOfReplicas(scheduledClusters)
-
-	// Step 3: Check the scale type (up or down).
-	if assignedReplicas > spec.Replicas {
-		// We need to reduce the replicas in terms of the previous result.
-		newTargetClusters, err := scaleDownScheduleByReplicaDivisionPreference(spec, preference)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scale down: %v", err)
-		}
-		return newTargetClusters, nil
-	} else if assignedReplicas < spec.Replicas {
-		// We need to enlarge the replicas in terms of the previous result (if exists).
-		// First scheduling is considered as a special kind of scaling up.
-		newTargetClusters, err := scaleUpScheduleByReplicaDivisionPreference(clusters, spec, preference, scheduledClusters, assignedReplicas)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scaleUp: %v", err)
-		}
-		return newTargetClusters, nil
-	} else {
-		return scheduledClusters, nil
-	}
-}
-
-// divideReplicasByStaticWeight assigns a total number of replicas to the selected clusters by the weight list.
-func divideReplicasByStaticWeight(clusters []*clusterv1alpha1.Cluster, weightList []policyv1alpha1.StaticClusterWeight,
-	replicas int32) ([]workv1alpha2.TargetCluster, error) {
-	weightSum := int64(0)
-	matchClusters := make(map[string]int64)
-	desireReplicaInfos := make(map[string]int64)
-
+func getStaticWeightInfoList(clusters []*clusterv1alpha1.Cluster, weightList []policyv1alpha1.StaticClusterWeight,
+	lastTargetClusters []workv1alpha2.TargetCluster) helper.ClusterWeightInfoList {
+	list := make(helper.ClusterWeightInfoList, 0)
 	for _, cluster := range clusters {
+		var weight int64
+		var lastReplicas int32
 		for _, staticWeightRule := range weightList {
 			if util.ClusterMatches(cluster, staticWeightRule.TargetCluster) {
-				weightSum += staticWeightRule.Weight
-				matchClusters[cluster.Name] = staticWeightRule.Weight
+				weight = util.MaxInt64(weight, staticWeightRule.Weight)
+			}
+		}
+		for _, lastTargetCluster := range lastTargetClusters {
+			if cluster.Name == lastTargetCluster.Name {
+				lastReplicas = lastTargetCluster.Replicas
 				break
 			}
 		}
+		if weight > 0 {
+			list = append(list, helper.ClusterWeightInfo{
+				ClusterName:  cluster.Name,
+				Weight:       weight,
+				LastReplicas: lastReplicas,
+			})
+		}
 	}
-
-	if weightSum == 0 {
+	if list.GetWeightSum() == 0 {
 		for _, cluster := range clusters {
-			weightSum++
-			matchClusters[cluster.Name] = 1
+			list = append(list, helper.ClusterWeightInfo{
+				ClusterName: cluster.Name,
+				Weight:      1,
+			})
 		}
 	}
-
-	allocatedReplicas := int32(0)
-	for clusterName, weight := range matchClusters {
-		desireReplicaInfos[clusterName] = weight * int64(replicas) / weightSum
-		allocatedReplicas += int32(desireReplicaInfos[clusterName])
-	}
-
-	clusterWeights := helper.SortClusterByWeight(matchClusters)
-
-	var clusterNames []string
-	for _, clusterWeightInfo := range clusterWeights {
-		clusterNames = append(clusterNames, clusterWeightInfo.ClusterName)
-	}
-
-	divideRemainingReplicas(int(replicas-allocatedReplicas), desireReplicaInfos, clusterNames)
-
-	targetClusters := make([]workv1alpha2.TargetCluster, len(desireReplicaInfos))
-	i := 0
-	for key, value := range desireReplicaInfos {
-		targetClusters[i] = workv1alpha2.TargetCluster{Name: key, Replicas: int32(value)}
-		i++
-	}
-	return targetClusters, nil
+	return list
 }
 
-// divideReplicasByPreference assigns a total number of replicas to the selected clusters by preference according to the resource.
-func divideReplicasByPreference(
-	clusterAvailableReplicas []workv1alpha2.TargetCluster,
-	replicas int32,
-	preference policyv1alpha1.ReplicaDivisionPreference,
-	scheduledClusterNames sets.String,
-) ([]workv1alpha2.TargetCluster, error) {
-	clustersMaxReplicas := util.GetSumOfReplicas(clusterAvailableReplicas)
-	if clustersMaxReplicas < replicas {
-		return nil, fmt.Errorf("clusters resources are not enough to schedule, max %d replicas are support", clustersMaxReplicas)
+// dynamicDivideReplicas assigns a total number of replicas to the selected clusters by preference according to the resource.
+func dynamicDivideReplicas(state *assignState) ([]workv1alpha2.TargetCluster, error) {
+	if state.availableReplicas < state.targetReplicas {
+		return nil, &framework.UnschedulableError{Message: fmt.Sprintf("Clusters available replicas %d are not enough to schedule.", state.availableReplicas)}
 	}
 
-	switch preference {
-	case policyv1alpha1.ReplicaDivisionPreferenceAggregated:
-		return divideReplicasByAggregation(clusterAvailableReplicas, replicas, scheduledClusterNames), nil
-	case policyv1alpha1.ReplicaDivisionPreferenceWeighted:
-		return divideReplicasByAvailableReplica(clusterAvailableReplicas, replicas, clustersMaxReplicas), nil
-	default:
-		return nil, fmt.Errorf("undefined replicaSchedulingType： %v", preference)
-	}
-}
-
-func divideReplicasByAggregation(clusterAvailableReplicas []workv1alpha2.TargetCluster,
-	replicas int32, scheduledClusterNames sets.String) []workv1alpha2.TargetCluster {
-	clusterAvailableReplicas = resortClusterList(clusterAvailableReplicas, scheduledClusterNames)
-	clustersNum, clustersMaxReplicas := 0, int32(0)
-	for _, clusterInfo := range clusterAvailableReplicas {
-		clustersNum++
-		clustersMaxReplicas += clusterInfo.Replicas
-		if clustersMaxReplicas >= replicas {
-			break
-		}
-	}
-	return divideReplicasByAvailableReplica(clusterAvailableReplicas[0:clustersNum], replicas, clustersMaxReplicas)
-}
-
-func divideReplicasByAvailableReplica(clusterAvailableReplicas []workv1alpha2.TargetCluster, replicas int32,
-	clustersMaxReplicas int32) []workv1alpha2.TargetCluster {
-	desireReplicaInfos := make(map[string]int64)
-	allocatedReplicas := int32(0)
-	for _, clusterInfo := range clusterAvailableReplicas {
-		desireReplicaInfos[clusterInfo.Name] = int64(clusterInfo.Replicas * replicas / clustersMaxReplicas)
-		allocatedReplicas += int32(desireReplicaInfos[clusterInfo.Name])
-	}
-
-	var clusterNames []string
-	for _, targetCluster := range clusterAvailableReplicas {
-		clusterNames = append(clusterNames, targetCluster.Name)
-	}
-	divideRemainingReplicas(int(replicas-allocatedReplicas), desireReplicaInfos, clusterNames)
-
-	targetClusters := make([]workv1alpha2.TargetCluster, len(desireReplicaInfos))
-	i := 0
-	for key, value := range desireReplicaInfos {
-		targetClusters[i] = workv1alpha2.TargetCluster{Name: key, Replicas: int32(value)}
-		i++
-	}
-	return targetClusters
-}
-
-// divideRemainingReplicas divide remaining Replicas to clusters and calculate desiredReplicaInfos
-func divideRemainingReplicas(remainingReplicas int, desiredReplicaInfos map[string]int64, clusterNames []string) {
-	if remainingReplicas <= 0 {
-		return
-	}
-
-	clusterSize := len(clusterNames)
-	if remainingReplicas < clusterSize {
-		for i := 0; i < remainingReplicas; i++ {
-			desiredReplicaInfos[clusterNames[i]]++
-		}
-	} else {
-		avg, residue := remainingReplicas/clusterSize, remainingReplicas%clusterSize
-		for i := 0; i < clusterSize; i++ {
-			if i < residue {
-				desiredReplicaInfos[clusterNames[i]] += int64(avg) + 1
-			} else {
-				desiredReplicaInfos[clusterNames[i]] += int64(avg)
+	switch state.strategyType {
+	case AggregatedStrategy:
+		state.availableClusters = state.resortAvailableClusters()
+		var sum int32
+		for i := range state.availableClusters {
+			if sum += state.availableClusters[i].Replicas; sum >= state.targetReplicas {
+				state.availableClusters = state.availableClusters[:i+1]
+				break
 			}
 		}
+		fallthrough
+	case DynamicWeightStrategy:
+		// Set the availableClusters as the weight, scheduledClusters as init result, target as the dispenser object.
+		// After dispensing, the target cluster will be the combination of init result and weighted result for target replicas.
+		return helper.SpreadReplicasByTargetClusters(state.targetReplicas, state.availableClusters, state.scheduledClusters), nil
+	default:
+		// should never happen
+		return nil, fmt.Errorf("undefined strategy type: %s", state.strategyType)
 	}
 }
 
-func scaleDownScheduleByReplicaDivisionPreference(
-	spec *workv1alpha2.ResourceBindingSpec,
-	preference policyv1alpha1.ReplicaDivisionPreference,
-) ([]workv1alpha2.TargetCluster, error) {
+func dynamicScaleDown(state *assignState) ([]workv1alpha2.TargetCluster, error) {
 	// The previous scheduling result will be the weight reference of scaling down.
 	// In other words, we scale down the replicas proportionally by their scheduled replicas.
-	return divideReplicasByPreference(spec.Clusters, spec.Replicas, preference, sets.NewString())
+	// Now:
+	// 1. targetReplicas is set to desired replicas.
+	// 2. availableClusters is set to the former schedule result.
+	// 3. scheduledClusters and assignedReplicas are not set, which implicates we consider this action as a first schedule.
+	state.targetReplicas = state.spec.Replicas
+	state.scheduledClusters = nil
+	state.buildAvailableClusters(func(_ []*clusterv1alpha1.Cluster, spec *workv1alpha2.ResourceBindingSpec) []workv1alpha2.TargetCluster {
+		availableClusters := make(TargetClustersList, len(spec.Clusters))
+		copy(availableClusters, spec.Clusters)
+		sort.Sort(availableClusters)
+		return availableClusters
+	})
+	return dynamicDivideReplicas(state)
 }
 
-func scaleUpScheduleByReplicaDivisionPreference(
-	clusters []*clusterv1alpha1.Cluster,
-	spec *workv1alpha2.ResourceBindingSpec,
-	preference policyv1alpha1.ReplicaDivisionPreference,
-	scheduledClusters []workv1alpha2.TargetCluster,
-	assignedReplicas int32,
-) ([]workv1alpha2.TargetCluster, error) {
-	// Step 1: Get how many replicas should be scheduled in this cycle and construct a new object if necessary
-	newSpec := spec
-	if assignedReplicas > 0 {
-		newSpec = spec.DeepCopy()
-		newSpec.Replicas = spec.Replicas - assignedReplicas
-	}
+func dynamicScaleUp(state *assignState) ([]workv1alpha2.TargetCluster, error) {
+	// Target is the extra ones.
+	state.targetReplicas = state.spec.Replicas - state.assignedReplicas
+	state.buildAvailableClusters(func(clusters []*clusterv1alpha1.Cluster, spec *workv1alpha2.ResourceBindingSpec) []workv1alpha2.TargetCluster {
+		clusterAvailableReplicas := calAvailableReplicas(clusters, spec)
+		sort.Sort(TargetClustersList(clusterAvailableReplicas))
+		return clusterAvailableReplicas
+	})
+	return dynamicDivideReplicas(state)
+}
 
-	// Step 2: Calculate available replicas of all candidates
-	clusterAvailableReplicas := calAvailableReplicas(clusters, newSpec)
-
-	// Step 3: Begin dividing.
-	// Only the new replicas are considered during this scheduler, the old replicas will not be moved.
-	// If not, the old replicas may be recreated which is not expected during scaling up.
-	// The parameter `scheduledClusterNames` is used to make sure that we assign new replicas to them preferentially
-	// so that all the replicas are aggregated.
-	result, err := divideReplicasByPreference(clusterAvailableReplicas, newSpec.Replicas,
-		preference, util.ConvertToClusterNames(scheduledClusters))
-	if err != nil {
-		return result, err
-	}
-
-	// Step 4: Merge the result of previous and new results.
-	return util.MergeTargetClusters(scheduledClusters, result), nil
+// dynamicFreshScale do a complete recalculation without referring to the last scheduling results.
+func dynamicFreshScale(state *assignState) ([]workv1alpha2.TargetCluster, error) {
+	// 1. targetReplicas is set to desired replicas
+	state.targetReplicas = state.spec.Replicas
+	state.buildAvailableClusters(func(clusters []*clusterv1alpha1.Cluster, spec *workv1alpha2.ResourceBindingSpec) []workv1alpha2.TargetCluster {
+		clusterAvailableReplicas := calAvailableReplicas(clusters, spec)
+		// 2. clusterAvailableReplicas should take into account the replicas already allocated
+		for _, scheduledCluster := range state.scheduledClusters {
+			for i, availableCluster := range clusterAvailableReplicas {
+				if availableCluster.Name != scheduledCluster.Name {
+					continue
+				}
+				clusterAvailableReplicas[i].Replicas += scheduledCluster.Replicas
+				break
+			}
+		}
+		sort.Sort(TargetClustersList(clusterAvailableReplicas))
+		return clusterAvailableReplicas
+	})
+	// 3. scheduledClusters are not set, which implicates we consider this action as a first schedule.
+	state.scheduledClusters = nil
+	return dynamicDivideReplicas(state)
 }

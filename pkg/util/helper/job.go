@@ -1,3 +1,19 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package helper
 
 import (
@@ -14,6 +30,7 @@ import (
 )
 
 // ParsingJobStatus generates new status of given 'AggregatedStatusItem'.
+//
 //nolint:gocyclo
 func ParsingJobStatus(obj *batchv1.Job, status []workv1alpha2.AggregatedStatusItem) (*batchv1.JobStatus, error) {
 	var jobFailed []string
@@ -36,7 +53,7 @@ func ParsingJobStatus(obj *batchv1.Job, status []workv1alpha2.AggregatedStatusIt
 		newStatus.Succeeded += temp.Succeeded
 		newStatus.Failed += temp.Failed
 
-		isFinished, finishedStatus := getJobFinishedStatus(temp)
+		isFinished, finishedStatus := GetJobFinishedStatus(temp)
 		if isFinished && finishedStatus == batchv1.JobComplete {
 			successfulJobs++
 		} else if isFinished && finishedStatus == batchv1.JobFailed {
@@ -67,7 +84,9 @@ func ParsingJobStatus(obj *batchv1.Job, status []workv1alpha2.AggregatedStatusIt
 		})
 	}
 
-	if successfulJobs == len(status) {
+	// aggregated status can be empty when the binding is just created
+	// in which case we should not set the job status to complete
+	if successfulJobs == len(status) && successfulJobs > 0 {
 		newStatus.Conditions = append(newStatus.Conditions, batchv1.JobCondition{
 			Type:               batchv1.JobComplete,
 			Status:             corev1.ConditionTrue,
@@ -88,9 +107,9 @@ func ParsingJobStatus(obj *batchv1.Job, status []workv1alpha2.AggregatedStatusIt
 	return newStatus, nil
 }
 
-// getJobFinishedStatus checks whether the given Job has finished execution.
+// GetJobFinishedStatus checks whether the given Job has finished execution.
 // It does not discriminate between successful and failed terminations.
-func getJobFinishedStatus(jobStatus *batchv1.JobStatus) (bool, batchv1.JobConditionType) {
+func GetJobFinishedStatus(jobStatus *batchv1.JobStatus) (bool, batchv1.JobConditionType) {
 	for _, c := range jobStatus.Conditions {
 		if (c.Type == batchv1.JobComplete || c.Type == batchv1.JobFailed) && c.Status == corev1.ConditionTrue {
 			return true, c.Type

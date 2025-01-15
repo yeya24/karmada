@@ -1,158 +1,44 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package helper
 
 import (
-	appsv1 "k8s.io/api/apps/v1"
-	batchv1 "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
-	discoveryv1 "k8s.io/api/discovery/v1"
-	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
+	"fmt"
+
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 
-	configv1alpha1 "github.com/karmada-io/karmada/pkg/apis/config/v1alpha1"
-	policyv1alpha1 "github.com/karmada-io/karmada/pkg/apis/policy/v1alpha1"
-	workv1alpha2 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha2"
 	"github.com/karmada-io/karmada/pkg/util"
 )
 
-// ConvertToPropagationPolicy converts a PropagationPolicy object from unstructured to typed.
-func ConvertToPropagationPolicy(obj *unstructured.Unstructured) (*policyv1alpha1.PropagationPolicy, error) {
-	typedObj := &policyv1alpha1.PropagationPolicy{}
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), typedObj); err != nil {
-		return nil, err
+// ConvertToTypedObject converts an unstructured object to typed.
+func ConvertToTypedObject(in, out interface{}) error {
+	if in == nil || out == nil {
+		return fmt.Errorf("convert objects should not be nil")
 	}
 
-	return typedObj, nil
-}
-
-// ConvertToClusterPropagationPolicy converts a ClusterPropagationPolicy object from unstructured to typed.
-func ConvertToClusterPropagationPolicy(obj *unstructured.Unstructured) (*policyv1alpha1.ClusterPropagationPolicy, error) {
-	typedObj := &policyv1alpha1.ClusterPropagationPolicy{}
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), typedObj); err != nil {
-		return nil, err
+	switch v := in.(type) {
+	case *unstructured.Unstructured:
+		return runtime.DefaultUnstructuredConverter.FromUnstructured(v.UnstructuredContent(), out)
+	case map[string]interface{}:
+		return runtime.DefaultUnstructuredConverter.FromUnstructured(v, out)
+	default:
+		return fmt.Errorf("convert object must be pointer of unstructured or map[string]interface{}")
 	}
-
-	return typedObj, nil
-}
-
-// ConvertToResourceBinding converts a ResourceBinding object from unstructured to typed.
-func ConvertToResourceBinding(obj *unstructured.Unstructured) (*workv1alpha2.ResourceBinding, error) {
-	typedObj := &workv1alpha2.ResourceBinding{}
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), typedObj); err != nil {
-		return nil, err
-	}
-
-	return typedObj, nil
-}
-
-// ConvertToPod converts a Pod object from unstructured to typed.
-func ConvertToPod(obj *unstructured.Unstructured) (*corev1.Pod, error) {
-	typedObj := &corev1.Pod{}
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), typedObj); err != nil {
-		return nil, err
-	}
-
-	return typedObj, nil
-}
-
-// ConvertToNode converts a Node object from unstructured to typed.
-func ConvertToNode(obj *unstructured.Unstructured) (*corev1.Node, error) {
-	typedObj := &corev1.Node{}
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), typedObj); err != nil {
-		return nil, err
-	}
-
-	return typedObj, nil
-}
-
-// ConvertToReplicaSet converts a ReplicaSet object from unstructured to typed.
-func ConvertToReplicaSet(obj *unstructured.Unstructured) (*appsv1.ReplicaSet, error) {
-	typedObj := &appsv1.ReplicaSet{}
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), typedObj); err != nil {
-		return nil, err
-	}
-
-	return typedObj, nil
-}
-
-// ConvertToDeployment converts a Deployment object from unstructured to typed.
-func ConvertToDeployment(obj *unstructured.Unstructured) (*appsv1.Deployment, error) {
-	typedObj := &appsv1.Deployment{}
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), typedObj); err != nil {
-		return nil, err
-	}
-
-	return typedObj, nil
-}
-
-// ConvertToDaemonSet converts a DaemonSet object from unstructured to typed.
-func ConvertToDaemonSet(obj *unstructured.Unstructured) (*appsv1.DaemonSet, error) {
-	typedObj := &appsv1.DaemonSet{}
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), typedObj); err != nil {
-		return nil, err
-	}
-
-	return typedObj, nil
-}
-
-// ConvertToStatefulSet converts a StatefulSet object from unstructured to typed.
-func ConvertToStatefulSet(obj *unstructured.Unstructured) (*appsv1.StatefulSet, error) {
-	typedObj := &appsv1.StatefulSet{}
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), typedObj); err != nil {
-		return nil, err
-	}
-
-	return typedObj, nil
-}
-
-// ConvertToJob converts a Job object from unstructured to typed.
-func ConvertToJob(obj *unstructured.Unstructured) (*batchv1.Job, error) {
-	typedObj := &batchv1.Job{}
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), typedObj); err != nil {
-		return nil, err
-	}
-
-	return typedObj, nil
-}
-
-// ConvertToEndpointSlice converts a EndpointSlice object from unstructured to typed.
-func ConvertToEndpointSlice(obj *unstructured.Unstructured) (*discoveryv1.EndpointSlice, error) {
-	typedObj := &discoveryv1.EndpointSlice{}
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), typedObj); err != nil {
-		return nil, err
-	}
-
-	return typedObj, nil
-}
-
-// ConvertToResourceExploringWebhookConfiguration converts a ResourceInterpreterWebhookConfiguration object from unstructured to typed.
-func ConvertToResourceExploringWebhookConfiguration(obj *unstructured.Unstructured) (*configv1alpha1.ResourceInterpreterWebhookConfiguration, error) {
-	typedObj := &configv1alpha1.ResourceInterpreterWebhookConfiguration{}
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), typedObj); err != nil {
-		return nil, err
-	}
-
-	return typedObj, nil
-}
-
-// ConvertToService converts a Service object from unstructured to typed.
-func ConvertToService(obj *unstructured.Unstructured) (*corev1.Service, error) {
-	typedObj := &corev1.Service{}
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), typedObj); err != nil {
-		return nil, err
-	}
-
-	return typedObj, nil
-}
-
-// ConvertToIngress converts a Service object from unstructured to typed.
-func ConvertToIngress(obj *unstructured.Unstructured) (*extensionsv1beta1.Ingress, error) {
-	typedObj := &extensionsv1beta1.Ingress{}
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.UnstructuredContent(), typedObj); err != nil {
-		return nil, err
-	}
-
-	return typedObj, nil
 }
 
 // ApplyReplica applies the Replica value for the specific field.

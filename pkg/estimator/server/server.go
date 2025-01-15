@@ -1,3 +1,19 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package server
 
 import (
@@ -7,11 +23,11 @@ import (
 	"time"
 
 	"github.com/kr/pretty"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
 	cacheddiscovery "k8s.io/client-go/discovery/cached/memory"
@@ -26,18 +42,25 @@ import (
 
 	"github.com/karmada-io/karmada/cmd/scheduler-estimator/app/options"
 	"github.com/karmada-io/karmada/pkg/estimator/pb"
+	"github.com/karmada-io/karmada/pkg/estimator/server/framework"
+	frameworkplugins "github.com/karmada-io/karmada/pkg/estimator/server/framework/plugins"
+	frameworkruntime "github.com/karmada-io/karmada/pkg/estimator/server/framework/runtime"
 	"github.com/karmada-io/karmada/pkg/estimator/server/metrics"
-	nodeutil "github.com/karmada-io/karmada/pkg/estimator/server/nodes"
 	"github.com/karmada-io/karmada/pkg/estimator/server/replica"
 	estimatorservice "github.com/karmada-io/karmada/pkg/estimator/service"
 	"github.com/karmada-io/karmada/pkg/util"
+	"github.com/karmada-io/karmada/pkg/util/fedinformer"
+	"github.com/karmada-io/karmada/pkg/util/fedinformer/genericmanager"
+	"github.com/karmada-io/karmada/pkg/util/fedinformer/keys"
+	"github.com/karmada-io/karmada/pkg/util/grpcconnection"
 	"github.com/karmada-io/karmada/pkg/util/helper"
-	"github.com/karmada-io/karmada/pkg/util/informermanager"
-	"github.com/karmada-io/karmada/pkg/util/informermanager/keys"
+	schedcache "github.com/karmada-io/karmada/pkg/util/lifted/scheduler/cache"
+	"github.com/karmada-io/karmada/pkg/util/lifted/scheduler/framework/parallelize"
 )
 
 const (
-	nodeNameKeyIndex = "spec.nodeName"
+	// Duration the scheduler will wait before expiring an assumed pod.
+	durationToExpireAssumedPod time.Duration = 0
 )
 
 var (
@@ -50,17 +73,19 @@ var (
 // AccurateSchedulerEstimatorServer is the gRPC server of a cluster accurate scheduler estimator.
 // Please see https://github.com/karmada-io/karmada/pull/580 (#580).
 type AccurateSchedulerEstimatorServer struct {
-	port            int
-	clusterName     string
-	kubeClient      kubernetes.Interface
-	restMapper      meta.RESTMapper
-	informerFactory informers.SharedInformerFactory
-	nodeInformer    infov1.NodeInformer
-	podInformer     infov1.PodInformer
-	nodeLister      listv1.NodeLister
-	replicaLister   *replica.ListerWrapper
-	getPodFunc      func(nodeName string) ([]*corev1.Pod, error)
-	informerManager informermanager.SingleClusterInformerManager
+	clusterName       string
+	kubeClient        kubernetes.Interface
+	restMapper        meta.RESTMapper
+	informerFactory   informers.SharedInformerFactory
+	nodeLister        listv1.NodeLister
+	replicaLister     *replica.ListerWrapper
+	informerManager   genericmanager.SingleClusterInformerManager
+	parallelizer      parallelize.Parallelizer
+	estimateFramework framework.Framework
+
+	Cache schedcache.Cache
+
+	GrpcConfig *grpcconnection.ServerConfig
 }
 
 // NewEstimatorServer creates an instance of AccurateSchedulerEstimatorServer.
@@ -70,65 +95,55 @@ func NewEstimatorServer(
 	discoveryClient discovery.DiscoveryInterface,
 	opts *options.Options,
 	stopChan <-chan struct{},
-) *AccurateSchedulerEstimatorServer {
+) (*AccurateSchedulerEstimatorServer, error) {
 	cachedDiscoClient := cacheddiscovery.NewMemCacheClient(discoveryClient)
 	restMapper := restmapper.NewDeferredDiscoveryRESTMapper(cachedDiscoClient)
 	informerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
+	informerFactory.InformerFor(&corev1.Pod{}, newPodInformer)
+
 	es := &AccurateSchedulerEstimatorServer{
-		port:            opts.ServerPort,
 		clusterName:     opts.ClusterName,
 		kubeClient:      kubeClient,
 		restMapper:      restMapper,
 		informerFactory: informerFactory,
-		nodeInformer:    informerFactory.Core().V1().Nodes(),
-		podInformer:     informerFactory.Core().V1().Pods(),
 		nodeLister:      informerFactory.Core().V1().Nodes().Lister(),
 		replicaLister: &replica.ListerWrapper{
 			PodLister:        informerFactory.Core().V1().Pods().Lister(),
 			ReplicaSetLister: informerFactory.Apps().V1().ReplicaSets().Lister(),
 		},
-	}
-
-	// Establish a connection between the pods and their assigned nodes.
-	_ = es.podInformer.Informer().AddIndexers(cache.Indexers{
-		nodeNameKeyIndex: func(obj interface{}) ([]string, error) {
-			pod, ok := obj.(*corev1.Pod)
-			if !ok {
-				return []string{}, nil
-			}
-			if len(pod.Spec.NodeName) == 0 {
-				return []string{}, nil
-			}
-			return []string{pod.Spec.NodeName}, nil
+		parallelizer: parallelize.NewParallelizer(opts.Parallelism),
+		Cache:        schedcache.New(durationToExpireAssumedPod, stopChan),
+		GrpcConfig: &grpcconnection.ServerConfig{
+			InsecureSkipClientVerify: opts.InsecureSkipGrpcClientVerify,
+			ClientAuthCAFile:         opts.GrpcClientCaFile,
+			CertFile:                 opts.GrpcAuthCertFile,
+			KeyFile:                  opts.GrpcAuthKeyFile,
+			ServerPort:               opts.ServerPort,
 		},
-	})
-
-	// The indexer helps us get all the pods that assigned to a node.
-	podIndexer := es.podInformer.Informer().GetIndexer()
-	es.getPodFunc = func(nodeName string) ([]*corev1.Pod, error) {
-		objs, err := podIndexer.ByIndex(nodeNameKeyIndex, nodeName)
-		if err != nil {
-			return nil, err
-		}
-		pods := make([]*corev1.Pod, 0, len(objs))
-		for _, obj := range objs {
-			pod, ok := obj.(*corev1.Pod)
-			if !ok {
-				continue
-			}
-			// Succeeded and failed pods are not considered because they don't occupy any resource.
-			// See https://github.com/kubernetes/kubernetes/blob/f61ed439882e34d9dad28b602afdc852feb2337a/pkg/scheduler/scheduler.go#L756-L763
-			if pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
-				pods = append(pods, pod)
-			}
-		}
-		return pods, nil
 	}
-	es.informerManager = informermanager.NewSingleClusterInformerManager(dynamicClient, 0, stopChan)
+	// ignore the error here because the informers haven't been started
+	_ = informerFactory.Core().V1().Nodes().Informer().SetTransform(fedinformer.StripUnusedFields)
+	_ = informerFactory.Core().V1().Pods().Informer().SetTransform(fedinformer.StripUnusedFields)
+	_ = informerFactory.Apps().V1().ReplicaSets().Informer().SetTransform(fedinformer.StripUnusedFields)
+
+	es.informerManager = genericmanager.NewSingleClusterInformerManager(dynamicClient, 0, stopChan)
 	for _, gvr := range supportedGVRs {
 		es.informerManager.Lister(gvr)
 	}
-	return es
+
+	registry := frameworkplugins.NewInTreeRegistry()
+	estimateFramework, err := frameworkruntime.NewFramework(registry,
+		frameworkruntime.WithClientSet(kubeClient),
+		frameworkruntime.WithInformerFactory(informerFactory),
+	)
+	if err != nil {
+		return es, err
+	}
+	es.estimateFramework = estimateFramework
+
+	addAllEventHandlers(es, informerFactory)
+
+	return es, nil
 }
 
 // Start runs the accurate replica estimator server.
@@ -138,25 +153,25 @@ func (es *AccurateSchedulerEstimatorServer) Start(ctx context.Context) error {
 	defer klog.Infof("Shutting down cluster(%s) accurate scheduler estimator", es.clusterName)
 
 	es.informerFactory.Start(stopCh)
-	if !es.waitForCacheSync(stopCh) {
-		return fmt.Errorf("failed to wait for cache sync")
-	}
+	es.informerFactory.WaitForCacheSync(stopCh)
 
 	es.informerManager.Start()
-	synced := es.informerManager.WaitForCacheSync()
-	if synced == nil {
+	if synced := es.informerManager.WaitForCacheSync(); synced == nil {
 		return fmt.Errorf("informer factory for cluster does not exist")
 	}
 
 	// Listen a port and register the gRPC server.
-	l, err := net.Listen("tcp", fmt.Sprintf(":%d", es.port))
+	l, err := net.Listen("tcp", fmt.Sprintf(":%d", es.GrpcConfig.ServerPort))
 	if err != nil {
-		return fmt.Errorf("failed to listen port %d: %v", es.port, err)
+		return fmt.Errorf("failed to listen port %d: %v", es.GrpcConfig.ServerPort, err)
 	}
-	klog.Infof("Listening port: %d", es.port)
+	klog.Infof("Listening port: %d", es.GrpcConfig.ServerPort)
 	defer l.Close()
 
-	s := grpc.NewServer()
+	s, err := es.GrpcConfig.NewServer()
+	if err != nil {
+		return fmt.Errorf("failed to create grpc server: %v", err)
+	}
 	estimatorservice.RegisterEstimatorServer(s, es)
 
 	// Graceful stop when the context is cancelled.
@@ -186,25 +201,26 @@ func (es *AccurateSchedulerEstimatorServer) MaxAvailableReplicas(ctx context.Con
 		object = m[0]
 	}
 
-	defer traceMaxAvailableReplicas(object, time.Now(), request)(&response, &rerr)
+	startTime := time.Now()
+
+	klog.V(4).Infof("Begin calculating cluster available replicas of resource(%s), request: %s", object, pretty.Sprint(*request))
+	defer func(start time.Time) {
+		metrics.CountRequests(rerr, metrics.EstimatingTypeMaxAvailableReplicas)
+		metrics.UpdateEstimatingAlgorithmLatency(rerr, metrics.EstimatingTypeMaxAvailableReplicas, metrics.EstimatingStepTotal, start)
+		if rerr != nil {
+			klog.Errorf("Failed to calculate cluster available replicas: %v", rerr)
+			return
+		}
+		klog.V(2).Infof("Finish calculating cluster available replicas of resource(%s), max replicas: %d, time elapsed: %s", object, response.MaxReplicas, time.Since(start))
+	}(startTime)
 
 	if request.Cluster != es.clusterName {
 		return nil, fmt.Errorf("cluster name does not match, got: %s, desire: %s", request.Cluster, es.clusterName)
 	}
-
-	// Step 1: Get all matched nodes by node claim
-	startTime := time.Now()
-	nodes, err := nodeutil.ListNodesByNodeClaim(es.nodeLister, request.ReplicaRequirements.NodeClaim)
-	metrics.UpdateEstimatingAlgorithmLatency(err, metrics.EstimatingTypeMaxAvailableReplicas, metrics.EstimatingStepListNodesByNodeClaim, startTime)
+	maxReplicas, err := es.EstimateReplicas(ctx, object, request)
 	if err != nil {
-		return nil, fmt.Errorf("failed to find matched nodes: %v", err)
+		return nil, fmt.Errorf("failed to estimate replicas: %v", err)
 	}
-
-	// Step 2: Calculate cluster max available replicas by filtered nodes
-	startTime = time.Now()
-	maxReplicas := es.maxAvailableReplicas(nodes, request.ReplicaRequirements.ResourceRequest)
-	metrics.UpdateEstimatingAlgorithmLatency(nil, metrics.EstimatingTypeMaxAvailableReplicas, metrics.EstimatingStepMaxAvailableReplicas, startTime)
-
 	return &pb.MaxAvailableReplicasResponse{MaxReplicas: maxReplicas}, nil
 }
 
@@ -220,7 +236,16 @@ func (es *AccurateSchedulerEstimatorServer) GetUnschedulableReplicas(ctx context
 		object = m[0]
 	}
 
-	defer traceGetUnschedulableReplicas(object, time.Now(), request)(&response, &rerr)
+	klog.V(4).Infof("Begin detecting cluster unschedulable replicas of resource(%s), request: %s", object, pretty.Sprint(*request))
+	defer func(start time.Time) {
+		metrics.CountRequests(rerr, metrics.EstimatingTypeGetUnschedulableReplicas)
+		metrics.UpdateEstimatingAlgorithmLatency(rerr, metrics.EstimatingTypeGetUnschedulableReplicas, metrics.EstimatingStepTotal, start)
+		if rerr != nil {
+			klog.Errorf("Failed to detect cluster unschedulable replicas: %v", rerr)
+			return
+		}
+		klog.V(2).Infof("Finish detecting cluster unschedulable replicas of resource(%s), unschedulable replicas: %d, time elapsed: %s", object, response.UnschedulableReplicas, time.Since(start))
+	}(time.Now())
 
 	if request.Cluster != es.clusterName {
 		return nil, fmt.Errorf("cluster name does not match, got: %s, desire: %s", request.Cluster, es.clusterName)
@@ -252,58 +277,12 @@ func (es *AccurateSchedulerEstimatorServer) GetUnschedulableReplicas(ctx context
 	return &pb.UnschedulableReplicasResponse{UnschedulableReplicas: unschedulables}, err
 }
 
-func (es *AccurateSchedulerEstimatorServer) maxAvailableReplicas(nodes []*corev1.Node, request corev1.ResourceList) int32 {
-	var maxReplicas int32
-	for _, node := range nodes {
-		maxReplica, err := es.nodeMaxAvailableReplica(node, request)
-		if err != nil {
-			klog.Errorf("Error: %v", err)
-			continue
-		}
-		klog.V(4).Infof("Node(%s) max available replica: %d", node.Name, maxReplica)
-		maxReplicas += maxReplica
+// newPodInformer creates a shared index informer that returns only non-terminal pods.
+// The PodInformer allows indexers to be added, but note that only non-conflict indexers are allowed.
+func newPodInformer(cs kubernetes.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
+	selector := fmt.Sprintf("status.phase!=%v,status.phase!=%v", corev1.PodSucceeded, corev1.PodFailed)
+	tweakListOptions := func(options *metav1.ListOptions) {
+		options.FieldSelector = selector
 	}
-	return maxReplicas
-}
-
-func (es *AccurateSchedulerEstimatorServer) nodeMaxAvailableReplica(node *corev1.Node, request corev1.ResourceList) (int32, error) {
-	pods, err := es.getPodFunc(node.Name)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get pods that assigned to node %s, err: %v", node.Name, err)
-	}
-	maxReplica, err := replica.NodeMaxAvailableReplica(node, pods, request)
-	if err != nil {
-		return 0, fmt.Errorf("failed to calculating max replica of node %s, err: %v", node.Name, err)
-	}
-	return maxReplica, nil
-}
-
-func (es *AccurateSchedulerEstimatorServer) waitForCacheSync(stopCh <-chan struct{}) bool {
-	return cache.WaitForCacheSync(stopCh, es.podInformer.Informer().HasSynced, es.nodeInformer.Informer().HasSynced)
-}
-
-func traceMaxAvailableReplicas(object string, start time.Time, request *pb.MaxAvailableReplicasRequest) func(response **pb.MaxAvailableReplicasResponse, err *error) {
-	klog.V(4).Infof("Begin calculating cluster available replicas of resource(%s), request: %s", object, pretty.Sprint(*request))
-	return func(response **pb.MaxAvailableReplicasResponse, err *error) {
-		metrics.CountRequests(*err, metrics.EstimatingTypeMaxAvailableReplicas)
-		metrics.UpdateEstimatingAlgorithmLatency(*err, metrics.EstimatingTypeMaxAvailableReplicas, metrics.EstimatingStepTotal, start)
-		if *err != nil {
-			klog.Errorf("Failed to calculate cluster available replicas: %v", *err)
-			return
-		}
-		klog.Infof("Finish calculating cluster available replicas of resource(%s), max replicas: %d, time elapsed: %s", object, (*response).MaxReplicas, time.Since(start))
-	}
-}
-
-func traceGetUnschedulableReplicas(object string, start time.Time, request *pb.UnschedulableReplicasRequest) func(response **pb.UnschedulableReplicasResponse, err *error) {
-	klog.V(4).Infof("Begin detecting cluster unschedulable replicas of resource(%s), request: %s", object, pretty.Sprint(*request))
-	return func(response **pb.UnschedulableReplicasResponse, err *error) {
-		metrics.CountRequests(*err, metrics.EstimatingTypeGetUnschedulableReplicas)
-		metrics.UpdateEstimatingAlgorithmLatency(*err, metrics.EstimatingTypeGetUnschedulableReplicas, metrics.EstimatingStepTotal, start)
-		if *err != nil {
-			klog.Errorf("Failed to detect cluster unschedulable replicas: %v", *err)
-			return
-		}
-		klog.Infof("Finish detecting cluster unschedulable replicas of resource(%s), unschedulable replicas: %d, time elapsed: %s", object, (*response).UnschedulableReplicas, time.Since(start))
-	}
+	return infov1.NewFilteredPodInformer(cs, metav1.NamespaceAll, resyncPeriod, cache.Indexers{}, tweakListOptions)
 }

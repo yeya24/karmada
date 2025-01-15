@@ -1,4 +1,18 @@
 #!/bin/bash
+# Copyright 2021 The Karmada Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 
 set -o errexit
 set -o nounset
@@ -49,15 +63,25 @@ then
 fi
 MEMBER_CLUSTER_NAME=$4
 
-kubectl --kubeconfig="${MEMBER_CLUSTER_KUBECONFIG}" config use-context "${MEMBER_CLUSTER_NAME}"
+TEMP_PATH="$(mktemp -d)"
+MEMBER_CLUSTER_KUBECONFIG_NAME="$(basename "${MEMBER_CLUSTER_KUBECONFIG}")"
+# --context & --minify will generate minified kubeconfig file with required context
+# --flatten will embed certificate
+kubectl config view --kubeconfig "${MEMBER_CLUSTER_KUBECONFIG}" \
+	--context "${MEMBER_CLUSTER_NAME}" --minify  --flatten \
+	> "${TEMP_PATH}/${MEMBER_CLUSTER_KUBECONFIG_NAME}"
 
 # check whether the kubeconfig secret has been created before
 if ! kubectl --kubeconfig="${HOST_CLUSTER_KUBECONFIG}" --context="${HOST_CLUSTER_NAME}" get secrets -n karmada-system | grep "${MEMBER_CLUSTER_NAME}-kubeconfig"; then
   # create secret
-  kubectl --kubeconfig="${HOST_CLUSTER_KUBECONFIG}" --context="${HOST_CLUSTER_NAME}" create secret generic ${MEMBER_CLUSTER_NAME}-kubeconfig --from-file=${MEMBER_CLUSTER_NAME}-kubeconfig="${MEMBER_CLUSTER_KUBECONFIG}" -n "karmada-system"
+  kubectl --kubeconfig="${HOST_CLUSTER_KUBECONFIG}" --context="${HOST_CLUSTER_NAME}" \
+  	create secret generic "${MEMBER_CLUSTER_NAME}-kubeconfig" \
+  	"--from-file=${MEMBER_CLUSTER_NAME}-kubeconfig=${TEMP_PATH}/${MEMBER_CLUSTER_KUBECONFIG_NAME}" \
+  	-n "karmada-system"
 fi
+rm -rf "${TEMP_PATH}"
 
-# deploy karmada agent
+# deploy scheduler estimator
 TEMP_PATH=$(mktemp -d)
 cp "${REPO_ROOT}"/artifacts/deploy/karmada-scheduler-estimator.yaml "${TEMP_PATH}"/karmada-scheduler-estimator.yaml
 sed -i'' -e "s/{{member_cluster_name}}/${MEMBER_CLUSTER_NAME}/g" "${TEMP_PATH}"/karmada-scheduler-estimator.yaml

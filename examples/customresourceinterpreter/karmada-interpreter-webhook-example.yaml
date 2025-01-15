@@ -21,36 +21,35 @@ spec:
           operator: Exists
       containers:
         - name: karmada-interpreter-webhook-example
-          image: swr.ap-southeast-1.myhuaweicloud.com/karmada/karmada-interpreter-webhook-example:latest
+          image: docker.io/karmada/karmada-interpreter-webhook-example:latest
           imagePullPolicy: IfNotPresent
           command:
             - /bin/karmada-interpreter-webhook-example
-            - --kubeconfig=/etc/kubeconfig
+            - --kubeconfig=/etc/karmada/config/karmada.config
             - --bind-address=0.0.0.0
             - --secure-port=8445
-            - --cert-dir=/var/serving-cert
+            - --cert-dir=/etc/karmada/pki/server
             - --v=4
           ports:
             - containerPort: 8445
-          volumeMounts:
-            - name: kubeconfig
-              subPath: kubeconfig
-              mountPath: /etc/kubeconfig
-            - name: cert
-              mountPath: /var/serving-cert
-              readOnly: true
           readinessProbe:
             httpGet:
               path: /readyz
               port: 8445
               scheme: HTTPS
+          volumeMounts:
+            - name: karmada-config
+              mountPath: /etc/karmada/config
+            - name: server-cert
+              mountPath: /etc/karmada/pki/server
+              readOnly: true
       volumes:
-        - name: kubeconfig
+        - name: karmada-config
           secret:
-            secretName: kubeconfig
-        - name: cert
+            secretName: karmada-interpreter-webhook-example-config
+        - name: server-cert
           secret:
-            secretName: webhook-cert
+            secretName: karmada-interpreter-webhook-example-cert
 ---
 apiVersion: v1
 kind: Service
@@ -63,6 +62,7 @@ spec:
   ports:
     - port: 443
       targetPort: 8445
+  type: LoadBalancer
 ---
 apiVersion: v1
 kind: ServiceAccount

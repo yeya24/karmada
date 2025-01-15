@@ -65,7 +65,7 @@ Now we add a new cluster member4. We may want to reschedule some replicas toward
 
 ### Architecture
 
-It is noticed that this design only focus on User Story 1, which means that only unscheduable pods are included for descheduling, usually happening when cluster resources are insufficient. Other stragety is not considered in this proposal because it needs more discussion.
+It is noticed that this design only focus on User Story 1, which means that only unscheduable pods are included for descheduling, usually happening when cluster resources are insufficient. Other strategy is not considered in this proposal because it needs more discussion.
 
 Here is the descheduler workflow. 
 
@@ -78,7 +78,7 @@ Here is the descheduler workflow.
   - List all `ResourceBindings`.
   - Find the non-desired ones, i.e., whose desired replicas are less than ready replicas, and then request scheduler-estimator to get the replicas that need to be evicted.
   - Get the unscheduable pods number from every cluster scheduler-estimator.
-  - Modify scheduling result in `resourcebindings.spec.clusters` for eviction, i.e., substract unscheduable pods number in the relevant field `resourcebindings.spec.clusters`.
+  - Modify scheduling result in `resourcebindings.spec.clusters` for eviction, i.e., subtract unscheduable pods number in the relevant field `resourcebindings.spec.clusters`.
 - Scheduler: Watch the `ResourceBinding` and begin to scale scheduling.
 
 ### API Change

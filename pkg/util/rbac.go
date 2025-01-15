@@ -1,3 +1,19 @@
+/*
+Copyright 2020 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package util
 
 import (
@@ -6,6 +22,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	kubeclient "k8s.io/client-go/kubernetes"
 )
 
@@ -84,8 +101,8 @@ func DeleteClusterRoleBinding(client kubeclient.Interface, name string) error {
 }
 
 // PolicyRuleAPIGroupMatches determines if the given policy rule is applied for requested group.
-func PolicyRuleAPIGroupMatches(rules *rbacv1.PolicyRule, requestedGroup string) bool {
-	for _, ruleGroup := range rules.APIGroups {
+func PolicyRuleAPIGroupMatches(rule *rbacv1.PolicyRule, requestedGroup string) bool {
+	for _, ruleGroup := range rule.APIGroups {
 		if ruleGroup == rbacv1.APIGroupAll {
 			return true
 		}
@@ -98,8 +115,8 @@ func PolicyRuleAPIGroupMatches(rules *rbacv1.PolicyRule, requestedGroup string) 
 }
 
 // PolicyRuleResourceMatches determines if the given policy rule is applied for requested resource.
-func PolicyRuleResourceMatches(rules *rbacv1.PolicyRule, requestedResource string) bool {
-	for _, ruleResource := range rules.Resources {
+func PolicyRuleResourceMatches(rule *rbacv1.PolicyRule, requestedResource string) bool {
+	for _, ruleResource := range rule.Resources {
 		if ruleResource == rbacv1.ResourceAll {
 			return true
 		}
@@ -117,8 +134,8 @@ func PolicyRuleResourceNameMatches(rule *rbacv1.PolicyRule, requestedName string
 		return true
 	}
 
-	for _, ruleName := range rule.ResourceNames {
-		if ruleName == requestedName {
+	for _, resourceName := range rule.ResourceNames {
+		if resourceName == requestedName {
 			return true
 		}
 	}
@@ -127,35 +144,96 @@ func PolicyRuleResourceNameMatches(rule *rbacv1.PolicyRule, requestedName string
 }
 
 // GenerateImpersonationRules generate PolicyRules from given subjects for impersonation.
-func GenerateImpersonationRules(allSubjects []rbacv1.Subject) []rbacv1.PolicyRule {
-	if len(allSubjects) == 0 {
+func GenerateImpersonationRules(subjects []rbacv1.Subject) []rbacv1.PolicyRule {
+	if len(subjects) == 0 {
 		return nil
 	}
 
-	var users, serviceAccounts, groups []string
-	for _, subject := range allSubjects {
+	users, serviceAccounts, groups := sets.NewString(), sets.NewString(), sets.NewString()
+	for _, subject := range subjects {
 		switch subject.Kind {
 		case rbacv1.UserKind:
-			users = append(users, subject.Name)
+			users.Insert(subject.Name)
 		case rbacv1.ServiceAccountKind:
-			serviceAccounts = append(serviceAccounts, subject.Name)
+			serviceAccounts.Insert(subject.Name)
 		case rbacv1.GroupKind:
-			groups = append(groups, subject.Name)
+			groups.Insert(subject.Name)
 		}
 	}
 
 	var rules []rbacv1.PolicyRule
-	if len(users) != 0 {
-		rules = append(rules, rbacv1.PolicyRule{Verbs: []string{"impersonate"}, Resources: []string{"users"}, APIGroups: []string{""}, ResourceNames: users})
+	if users.Len() != 0 {
+		rules = append(rules, rbacv1.PolicyRule{
+			Verbs:         []string{"impersonate"},
+			APIGroups:     []string{""},
+			Resources:     []string{"users"},
+			ResourceNames: sets.StringKeySet(users).List(),
+		})
 	}
 
-	if len(serviceAccounts) != 0 {
-		rules = append(rules, rbacv1.PolicyRule{Verbs: []string{"impersonate"}, Resources: []string{"serviceaccounts"}, APIGroups: []string{""}, ResourceNames: serviceAccounts})
+	if serviceAccounts.Len() != 0 {
+		rules = append(rules, rbacv1.PolicyRule{
+			Verbs:         []string{"impersonate"},
+			APIGroups:     []string{""},
+			Resources:     []string{"serviceaccounts"},
+			ResourceNames: sets.StringKeySet(serviceAccounts).List(),
+		})
 	}
 
-	if len(groups) != 0 {
-		rules = append(rules, rbacv1.PolicyRule{Verbs: []string{"impersonate"}, Resources: []string{"groups"}, APIGroups: []string{""}, ResourceNames: groups})
+	if groups.Len() != 0 {
+		rules = append(rules, rbacv1.PolicyRule{
+			Verbs:         []string{"impersonate"},
+			APIGroups:     []string{""},
+			Resources:     []string{"groups"},
+			ResourceNames: sets.StringKeySet(groups).List(),
+		})
 	}
 
 	return rules
+}
+
+// CreateRole just try to create the Role.
+func CreateRole(client kubeclient.Interface, roleObj *rbacv1.Role) (*rbacv1.Role, error) {
+	createdObj, err := client.RbacV1().Roles(roleObj.GetNamespace()).Create(context.TODO(), roleObj, metav1.CreateOptions{})
+	if err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return roleObj, nil
+		}
+
+		return nil, err
+	}
+
+	return createdObj, nil
+}
+
+// CreateRoleBinding just try to create the RoleBinding.
+func CreateRoleBinding(client kubeclient.Interface, roleBindingObj *rbacv1.RoleBinding) (*rbacv1.RoleBinding, error) {
+	createdObj, err := client.RbacV1().RoleBindings(roleBindingObj.GetNamespace()).Create(context.TODO(), roleBindingObj, metav1.CreateOptions{})
+	if err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return roleBindingObj, nil
+		}
+
+		return nil, err
+	}
+
+	return createdObj, nil
+}
+
+// DeleteRole just try to delete the Role.
+func DeleteRole(client kubeclient.Interface, namespace, name string) error {
+	err := client.RbacV1().Roles(namespace).Delete(context.TODO(), name, metav1.DeleteOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	return nil
+}
+
+// DeleteRoleBinding just try to delete the RoleBinding.
+func DeleteRoleBinding(client kubeclient.Interface, namespace, name string) error {
+	err := client.RbacV1().RoleBindings(namespace).Delete(context.TODO(), name, metav1.DeleteOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	return nil
 }

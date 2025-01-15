@@ -1,3 +1,19 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package options
 
 import (
@@ -6,14 +22,27 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
+// a callback function to modify options
+type ModifyOptions func(option *Options)
+
+// New an Options with default parameters
+func New(modifyOptions ModifyOptions) Options {
+	option := Options{
+		BindAddress:  "127.0.0.1",
+		SecurePort:   9000,
+		KubeAPIQPS:   40,
+		KubeAPIBurst: 30,
+	}
+
+	if modifyOptions != nil {
+		modifyOptions(&option)
+	}
+	return option
+}
+
 func TestValidateKarmadaWebhookConfiguration(t *testing.T) {
 	successCases := []Options{
-		{
-			BindAddress:  "127.0.0.1",
-			SecurePort:   9000,
-			KubeAPIQPS:   40,
-			KubeAPIBurst: 30,
-		},
+		New(nil),
 	}
 	for _, successCases := range successCases {
 		if errs := successCases.Validate(); len(errs) != 0 {
@@ -26,21 +55,15 @@ func TestValidateKarmadaWebhookConfiguration(t *testing.T) {
 		expectedErrs field.ErrorList
 	}{
 		"invalid BindAddress": {
-			opt: Options{
-				BindAddress:  "127.0.0.1:8080",
-				SecurePort:   9000,
-				KubeAPIQPS:   40,
-				KubeAPIBurst: 30,
-			},
+			opt: New(func(option *Options) {
+				option.BindAddress = "127.0.0.1:8080"
+			}),
 			expectedErrs: field.ErrorList{field.Invalid(newPath.Child("BindAddress"), "127.0.0.1:8080", "not a valid textual representation of an IP address")},
 		},
 		"invalid SecurePort": {
-			opt: Options{
-				BindAddress:  "127.0.0.1",
-				SecurePort:   900000,
-				KubeAPIQPS:   40,
-				KubeAPIBurst: 30,
-			},
+			opt: New(func(option *Options) {
+				option.SecurePort = 900000
+			}),
 			expectedErrs: field.ErrorList{field.Invalid(newPath.Child("SecurePort"), 900000, "must be a valid port between 0 and 65535 inclusive")},
 		},
 	}

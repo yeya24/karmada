@@ -1,4 +1,18 @@
 #!/bin/bash
+# Copyright 2021 The Karmada Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 
 set -o errexit
 set -o nounset
@@ -42,9 +56,9 @@ fi
 KARMADA_APISERVER_KUBECONFIG=$3
 
 # check context existence
-if ! kubectl config use-context "${4}" --kubeconfig="${KARMADA_APISERVER_KUBECONFIG}" > /dev/null 2>&1;
+if ! kubectl config get-contexts "${4}" --kubeconfig="${KARMADA_APISERVER_KUBECONFIG}" > /dev/null 2>&1;
 then
-  echo -e "ERROR: failed to use context: '${4}' not in ${KARMADA_APISERVER_KUBECONFIG}. \n"
+  echo -e "ERROR: failed to get context: '${4}' not in ${KARMADA_APISERVER_KUBECONFIG}. \n"
   usage
   exit 1
 fi
@@ -59,7 +73,7 @@ fi
 MEMBER_CLUSTER_KUBECONFIG=$5
 
 # check context existence
-if ! kubectl config use-context "${6}" --kubeconfig="${MEMBER_CLUSTER_KUBECONFIG}" > /dev/null 2>&1;
+if ! kubectl config get-contexts "${6}" --kubeconfig="${MEMBER_CLUSTER_KUBECONFIG}" > /dev/null 2>&1;
 then
   echo -e "ERROR: failed to get context: '${6}' not in ${MEMBER_CLUSTER_KUBECONFIG}. \n"
   usage
