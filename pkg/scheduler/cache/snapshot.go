@@ -1,3 +1,19 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package cache
 
 import (
@@ -15,8 +31,8 @@ type Snapshot struct {
 }
 
 // NewEmptySnapshot initializes a Snapshot struct and returns it.
-func NewEmptySnapshot() *Snapshot {
-	return &Snapshot{}
+func NewEmptySnapshot() Snapshot {
+	return Snapshot{}
 }
 
 // NumOfClusters returns the number of clusters.
@@ -42,8 +58,8 @@ func (s *Snapshot) GetReadyClusters() []*framework.ClusterInfo {
 }
 
 // GetReadyClusterNames returns the clusterNames in ready status.
-func (s *Snapshot) GetReadyClusterNames() sets.String {
-	readyClusterNames := sets.NewString()
+func (s *Snapshot) GetReadyClusterNames() sets.Set[string] {
+	readyClusterNames := sets.New[string]()
 	for _, c := range s.clusterInfoList {
 		if util.IsClusterReady(&c.Cluster().Status) {
 			readyClusterNames.Insert(c.Cluster().Name)

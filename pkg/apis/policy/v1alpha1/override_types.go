@@ -1,3 +1,19 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package v1alpha1
 
 import (
@@ -27,7 +43,7 @@ const (
 
 // +genclient
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
-// +kubebuilder:resource:shortName=op
+// +kubebuilder:resource:path=overridepolicies,scope=Namespaced,shortName=op,categories={karmada-io}
 
 // OverridePolicy represents the policy that overrides a group of resources to one or more clusters.
 type OverridePolicy struct {
@@ -79,8 +95,13 @@ type RuleWithCluster struct {
 
 // Overriders offers various alternatives to represent the override rules.
 //
-// If more than one alternatives exist, they will be applied with following order:
+// If more than one alternative exists, they will be applied with following order:
 // - ImageOverrider
+// - CommandOverrider
+// - ArgsOverrider
+// - LabelsOverrider
+// - AnnotationsOverrider
+// - FieldOverrider
 // - Plaintext
 type Overriders struct {
 	// Plaintext represents override rules defined with plaintext overriders.
@@ -98,6 +119,36 @@ type Overriders struct {
 	// ArgsOverrider represents the rules dedicated to handling container args
 	// +optional
 	ArgsOverrider []CommandArgsOverrider `json:"argsOverrider,omitempty"`
+
+	// LabelsOverrider represents the rules dedicated to handling workload labels
+	// +optional
+	LabelsOverrider []LabelAnnotationOverrider `json:"labelsOverrider,omitempty"`
+
+	// AnnotationsOverrider represents the rules dedicated to handling workload annotations
+	// +optional
+	AnnotationsOverrider []LabelAnnotationOverrider `json:"annotationsOverrider,omitempty"`
+
+	// FieldOverrider represents the rules dedicated to modifying a specific field in any Kubernetes resource.
+	// This allows changing a single field within the resource with multiple operations.
+	// It is designed to handle structured field values such as those found in ConfigMaps or Secrets.
+	// The current implementation supports JSON and YAML formats, but can easily be extended to support XML in the future.
+	// +optional
+	FieldOverrider []FieldOverrider `json:"fieldOverrider,omitempty"`
+}
+
+// LabelAnnotationOverrider represents the rules dedicated to handling workload labels/annotations
+type LabelAnnotationOverrider struct {
+	// Operator represents the operator which will apply on the workload.
+	// +kubebuilder:validation:Enum=add;remove;replace
+	// +required
+	Operator OverriderOperator `json:"operator"`
+
+	// Value to be applied to annotations/labels of workload.
+	// Items in Value which will be appended after annotations/labels when Operator is 'add'.
+	// Items in Value which match in annotations/labels will be deleted when Operator is 'remove'.
+	// Items in Value which match in annotations/labels will be replaced when Operator is 'replace'.
+	// +required
+	Value map[string]string `json:"value,omitempty"`
 }
 
 // ImageOverrider represents the rules dedicated to handling image overrides.
@@ -105,12 +156,14 @@ type ImageOverrider struct {
 	// Predicate filters images before applying the rule.
 	//
 	// Defaults to nil, in that case, the system will automatically detect image fields if the resource type is
-	// Pod, ReplicaSet, Deployment or StatefulSet by following rule:
-	//   - Pod: spec/containers/<N>/image
-	//   - ReplicaSet: spec/template/spec/containers/<N>/image
-	//   - Deployment: spec/template/spec/containers/<N>/image
-	//   - StatefulSet: spec/template/spec/containers/<N>/image
-	// In addition, all images will be processed if the resource object has more than one containers.
+	// Pod, ReplicaSet, Deployment, StatefulSet, DaemonSet or Job by following rule:
+	//   - Pod: /spec/containers/<N>/image
+	//   - ReplicaSet: /spec/template/spec/containers/<N>/image
+	//   - Deployment: /spec/template/spec/containers/<N>/image
+	//   - DaemonSet: /spec/template/spec/containers/<N>/image
+	//   - StatefulSet: /spec/template/spec/containers/<N>/image
+	//   - Job: /spec/template/spec/containers/<N>/image
+	// In addition, all images will be processed if the resource object has more than one container.
 	//
 	// If not nil, only images matches the filters will be processed.
 	// +optional
@@ -119,7 +172,7 @@ type ImageOverrider struct {
 	// Component is part of image name.
 	// Basically we presume an image can be made of '[registry/]repository[:tag]'.
 	// The registry could be:
-	// - k8s.gcr.io
+	// - registry.k8s.io
 	// - fictional.registry.example:10443
 	// The repository could be:
 	// - kube-apiserver
@@ -191,7 +244,7 @@ type PlaintextOverrider struct {
 	// Path indicates the path of target field
 	Path string `json:"path"`
 	// Operator indicates the operation on target field.
-	// Available operators are: add, update and remove.
+	// Available operators are: add, replace and remove.
 	// +kubebuilder:validation:Enum=add;remove;replace
 	Operator OverriderOperator `json:"operator"`
 	// Value to be applied to target field.
@@ -210,6 +263,65 @@ const (
 	OverriderOpReplace OverriderOperator = "replace"
 )
 
+// FieldOverrider represents the rules dedicated to modifying a specific field in any Kubernetes resource.
+// This allows changing a single field within the resource with multiple operations.
+// It is designed to handle structured field values such as those found in ConfigMaps or Secrets.
+// The current implementation supports JSON and YAML formats, but can easily be extended to support XML in the future.
+// Note: In any given instance, FieldOverrider processes either JSON or YAML fields, but not both simultaneously.
+type FieldOverrider struct {
+	// FieldPath specifies the initial location in the instance document where the operation should take place.
+	// The path uses RFC 6901 for navigating into nested structures. For example, the path "/data/db-config.yaml"
+	// specifies the configuration data key named "db-config.yaml" in a ConfigMap: "/data/db-config.yaml".
+	// +required
+	FieldPath string `json:"fieldPath"`
+
+	// JSON represents the operations performed on the JSON document specified by the FieldPath.
+	// +optional
+	JSON []JSONPatchOperation `json:"json,omitempty"`
+
+	// YAML represents the operations performed on the YAML document specified by the FieldPath.
+	// +optional
+	YAML []YAMLPatchOperation `json:"yaml,omitempty"`
+}
+
+// JSONPatchOperation represents a single field modification operation for JSON format.
+type JSONPatchOperation struct {
+	// SubPath specifies the relative location within the initial FieldPath where the operation should take place.
+	// The path uses RFC 6901 for navigating into nested structures.
+	// +required
+	SubPath string `json:"subPath"`
+
+	// Operator indicates the operation on target field.
+	// Available operators are: "add", "remove", and "replace".
+	// +kubebuilder:validation:Enum=add;remove;replace
+	// +required
+	Operator OverriderOperator `json:"operator"`
+
+	// Value is the new value to set for the specified field if the operation is "add" or "replace".
+	// For "remove" operation, this field is ignored.
+	// +optional
+	Value apiextensionsv1.JSON `json:"value,omitempty"`
+}
+
+// YAMLPatchOperation represents a single field modification operation for YAML format.
+type YAMLPatchOperation struct {
+	// SubPath specifies the relative location within the initial FieldPath where the operation should take place.
+	// The path uses RFC 6901 for navigating into nested structures.
+	// +required
+	SubPath string `json:"subPath"`
+
+	// Operator indicates the operation on target field.
+	// Available operators are: "add", "remove", and "replace".
+	// +kubebuilder:validation:Enum=add;remove;replace
+	// +required
+	Operator OverriderOperator `json:"operator"`
+
+	// Value is the new value to set for the specified field if the operation is "add" or "replace".
+	// For "remove" operation, this field is ignored.
+	// +optional
+	Value apiextensionsv1.JSON `json:"value,omitempty"`
+}
+
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // OverridePolicyList is a collection of OverridePolicy.
@@ -223,7 +335,7 @@ type OverridePolicyList struct {
 
 // +genclient
 // +genclient:nonNamespaced
-// +kubebuilder:resource:scope="Cluster",shortName=cop
+// +kubebuilder:resource:path=clusteroverridepolicies,scope="Cluster",shortName=cop,categories={karmada-io}
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // ClusterOverridePolicy represents the cluster-wide policy that overrides a group of resources to one or more clusters.

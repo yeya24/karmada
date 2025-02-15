@@ -1,10 +1,25 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package core
 
 import (
 	"context"
 	"fmt"
 	"math"
-	"sort"
 
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
@@ -14,7 +29,10 @@ import (
 	workv1alpha2 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha2"
 	estimatorclient "github.com/karmada-io/karmada/pkg/estimator/client"
 	"github.com/karmada-io/karmada/pkg/util"
+	"github.com/karmada-io/karmada/pkg/util/names"
 )
+
+type calculator func([]*clusterv1alpha1.Cluster, *workv1alpha2.ResourceBindingSpec) []workv1alpha2.TargetCluster
 
 func getDefaultWeightPreference(clusters []*clusterv1alpha1.Cluster) *policyv1alpha1.ClusterPreferences {
 	staticWeightLists := make([]policyv1alpha1.StaticClusterWeight, 0)
@@ -42,16 +60,27 @@ func calAvailableReplicas(clusters []*clusterv1alpha1.Cluster, spec *workv1alpha
 		availableTargetClusters[i].Replicas = math.MaxInt32
 	}
 
+	// For non-workload, like ServiceAccount, ConfigMap, Secret and etc, it's unnecessary to calculate available replicas in member clusters.
+	// See issue: https://github.com/karmada-io/karmada/issues/3743.
+	namespacedKey := names.NamespacedKey(spec.Resource.Namespace, spec.Resource.Name)
+	if spec.Replicas == 0 {
+		klog.V(4).Infof("Do not calculate available replicas for non-workload(%s, kind=%s, %s).", spec.Resource.APIVersion,
+			spec.Resource.Kind, namespacedKey)
+		return availableTargetClusters
+	}
+
 	// Get the minimum value of MaxAvailableReplicas in terms of all estimators.
 	estimators := estimatorclient.GetReplicaEstimators()
 	ctx := context.WithValue(context.TODO(), util.ContextKeyObject,
 		fmt.Sprintf("kind=%s, name=%s/%s", spec.Resource.Kind, spec.Resource.Namespace, spec.Resource.Name))
-	for _, estimator := range estimators {
+	for name, estimator := range estimators {
 		res, err := estimator.MaxAvailableReplicas(ctx, clusters, spec.ReplicaRequirements)
 		if err != nil {
 			klog.Errorf("Max cluster available replicas error: %v", err)
 			continue
 		}
+		klog.V(4).Infof("Invoked MaxAvailableReplicas of estimator %s for workload(%s, kind=%s, %s): %v", name,
+			spec.Resource.APIVersion, spec.Resource.Kind, namespacedKey, res)
 		for i := range res {
 			if res[i].Replicas == estimatorclient.UnauthenticReplica {
 				continue
@@ -70,53 +99,32 @@ func calAvailableReplicas(clusters []*clusterv1alpha1.Cluster, spec *workv1alpha
 		}
 	}
 
-	sort.Sort(TargetClustersList(availableTargetClusters))
-	klog.V(4).Infof("Target cluster: %v", availableTargetClusters)
+	klog.V(4).Infof("Target cluster calculated by estimators (available cluster && maxAvailableReplicas): %v", availableTargetClusters)
 	return availableTargetClusters
 }
 
-// findOutScheduledCluster will return a slice of clusters
-// which are a part of `TargetClusters` and have non-zero replicas.
-func findOutScheduledCluster(tcs []workv1alpha2.TargetCluster, candidates []*clusterv1alpha1.Cluster) []workv1alpha2.TargetCluster {
-	validTarget := make([]workv1alpha2.TargetCluster, 0)
-	if len(tcs) == 0 {
-		return validTarget
+// attachZeroReplicasCluster  attach cluster in clusters into targetCluster
+// The purpose is to avoid workload not appeared in rb's spec.clusters field
+func attachZeroReplicasCluster(clusters []*clusterv1alpha1.Cluster, targetClusters []workv1alpha2.TargetCluster) []workv1alpha2.TargetCluster {
+	targetClusterSet := sets.NewString()
+	for i := range targetClusters {
+		targetClusterSet.Insert(targetClusters[i].Name)
 	}
-
-	for _, targetCluster := range tcs {
-		// must have non-zero replicas
-		if targetCluster.Replicas <= 0 {
-			continue
-		}
-		// must in `candidates`
-		for _, cluster := range candidates {
-			if targetCluster.Name == cluster.Name {
-				validTarget = append(validTarget, targetCluster)
-				break
-			}
+	for i := range clusters {
+		if !targetClusterSet.Has(clusters[i].Name) {
+			targetClusters = append(targetClusters, workv1alpha2.TargetCluster{Name: clusters[i].Name, Replicas: 0})
 		}
 	}
-
-	return validTarget
+	return targetClusters
 }
 
-// resortClusterList is used to make sure scheduledClusterNames are in front of the other clusters in the list of
-// clusterAvailableReplicas so that we can assign new replicas to them preferentially when scale up.
-// Note that scheduledClusterNames have none items during first scheduler
-func resortClusterList(clusterAvailableReplicas []workv1alpha2.TargetCluster, scheduledClusterNames sets.String) []workv1alpha2.TargetCluster {
-	if scheduledClusterNames.Len() == 0 {
-		return clusterAvailableReplicas
-	}
-	var preUsedCluster []workv1alpha2.TargetCluster
-	var unUsedCluster []workv1alpha2.TargetCluster
-	for i := range clusterAvailableReplicas {
-		if scheduledClusterNames.Has(clusterAvailableReplicas[i].Name) {
-			preUsedCluster = append(preUsedCluster, clusterAvailableReplicas[i])
-		} else {
-			unUsedCluster = append(unUsedCluster, clusterAvailableReplicas[i])
+// removeZeroReplicasCLuster remove the cluster with 0 replicas in assignResults
+func removeZeroReplicasCluster(assignResults []workv1alpha2.TargetCluster) []workv1alpha2.TargetCluster {
+	targetClusters := make([]workv1alpha2.TargetCluster, 0, len(assignResults))
+	for _, cluster := range assignResults {
+		if cluster.Replicas > 0 {
+			targetClusters = append(targetClusters, workv1alpha2.TargetCluster{Name: cluster.Name, Replicas: cluster.Replicas})
 		}
 	}
-	clusterAvailableReplicas = append(preUsedCluster, unUsedCluster...)
-	klog.V(4).Infof("Resorted target cluster: %v", clusterAvailableReplicas)
-	return clusterAvailableReplicas
+	return targetClusters
 }

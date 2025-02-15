@@ -1,10 +1,26 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package kubernetes
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -14,20 +30,26 @@ import (
 	"github.com/karmada-io/karmada/pkg/karmadactl/cmdinit/utils"
 )
 
-var (
-	etcdNodeName       string
-	etcdSelectorLabels map[string]string
-)
+func (i *CommandInitOption) getKarmadaAPIServerIP() error {
+	if i.KarmadaAPIServerAdvertiseAddress != "" {
+		i.KarmadaAPIServerIP = append(i.KarmadaAPIServerIP, utils.StringToNetIP(i.KarmadaAPIServerAdvertiseAddress))
+		return nil
+	}
 
-func (i *CommandInitOption) getKubeMasterIP() error {
 	nodeClient := i.KubeClientSet.CoreV1().Nodes()
 	masterNodes, err := nodeClient.List(context.TODO(), metav1.ListOptions{LabelSelector: "node-role.kubernetes.io/master"})
 	if err != nil {
 		return err
 	}
+	if len(masterNodes.Items) == 0 {
+		masterNodes, err = nodeClient.List(context.TODO(), metav1.ListOptions{LabelSelector: "node-role.kubernetes.io/control-plane"})
+		if err != nil {
+			return err
+		}
+	}
 
 	if len(masterNodes.Items) == 0 {
-		klog.Warning("the kubernetes cluster does not have a Master role.")
+		klog.Warning("The kubernetes cluster does not have a Master role.")
 	} else {
 		for _, v := range masterNodes.Items {
 			i.KarmadaAPIServerIP = append(i.KarmadaAPIServerIP, utils.StringToNetIP(v.Status.Addresses[0].Address))
@@ -35,7 +57,7 @@ func (i *CommandInitOption) getKubeMasterIP() error {
 		return nil
 	}
 
-	klog.Info("randomly select 3 Node IPs in the kubernetes cluster.")
+	klog.Info("Randomly select 3 Node IPs in the kubernetes cluster.")
 	nodes, err := nodeClient.List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		return err
@@ -55,8 +77,8 @@ func (i *CommandInitOption) getKubeMasterIP() error {
 }
 
 // nodeStatus Check the node status, if it is an unhealthy node, return false.
-func nodeStatus(node []corev1.NodeCondition) bool {
-	for _, v := range node {
+func nodeStatus(nodeConditions []corev1.NodeCondition) bool {
+	for _, v := range nodeConditions {
 		switch v.Type {
 		case corev1.NodeReady:
 			if v.Status != corev1.ConditionTrue {
@@ -91,6 +113,8 @@ func (i *CommandInitOption) AddNodeSelectorLabels() error {
 		return err
 	}
 
+	var etcdNodeName string
+	var etcdSelectorLabels map[string]string
 	for _, v := range nodes.Items {
 		if v.Spec.Taints != nil {
 			continue
@@ -99,8 +123,15 @@ func (i *CommandInitOption) AddNodeSelectorLabels() error {
 		if nodeStatus(v.Status.Conditions) {
 			etcdNodeName = v.Name
 			etcdSelectorLabels = v.Labels
+			if etcdSelectorLabels == nil {
+				etcdSelectorLabels = map[string]string{}
+			}
 			break
 		}
+	}
+
+	if etcdSelectorLabels == nil {
+		return errors.New("failed to find a healthy node for karmada-etcd")
 	}
 
 	etcdSelectorLabels["karmada.io/etcd"] = ""
@@ -114,8 +145,7 @@ func (i *CommandInitOption) AddNodeSelectorLabels() error {
 }
 
 func (i *CommandInitOption) isNodeExist(labels string) bool {
-	l := strings.Split(labels, "=")
-	node, err := i.KubeClientSet.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{LabelSelector: l[0]})
+	node, err := i.KubeClientSet.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{LabelSelector: labels})
 	if err != nil {
 		return false
 	}

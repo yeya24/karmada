@@ -1,3 +1,19 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package cache
 
 import (
@@ -15,7 +31,7 @@ type Cache interface {
 	UpdateCluster(cluster *clusterv1alpha1.Cluster)
 	DeleteCluster(cluster *clusterv1alpha1.Cluster)
 	// Snapshot returns a snapshot of the current clusters info
-	Snapshot() *Snapshot
+	Snapshot() Snapshot
 }
 
 type schedulerCache struct {
@@ -30,25 +46,27 @@ func NewCache(clusterLister clusterlister.ClusterLister) Cache {
 }
 
 // AddCluster does nothing since clusterLister would synchronize automatically
-func (c *schedulerCache) AddCluster(cluster *clusterv1alpha1.Cluster) {
+func (c *schedulerCache) AddCluster(_ *clusterv1alpha1.Cluster) {
 }
 
 // UpdateCluster does nothing since clusterLister would synchronize automatically
-func (c *schedulerCache) UpdateCluster(cluster *clusterv1alpha1.Cluster) {
+func (c *schedulerCache) UpdateCluster(_ *clusterv1alpha1.Cluster) {
 }
 
 // DeleteCluster does nothing since clusterLister would synchronize automatically
-func (c *schedulerCache) DeleteCluster(cluster *clusterv1alpha1.Cluster) {
+func (c *schedulerCache) DeleteCluster(_ *clusterv1alpha1.Cluster) {
 }
 
+// Snapshot returns clusters' snapshot.
 // TODO: need optimization, only clone when necessary
-func (c *schedulerCache) Snapshot() *Snapshot {
+func (c *schedulerCache) Snapshot() Snapshot {
+	out := NewEmptySnapshot()
 	clusters, err := c.clusterLister.List(labels.Everything())
 	if err != nil {
 		klog.Errorf("Failed to list clusters: %v", err)
-		return nil
+		return out
 	}
-	out := NewEmptySnapshot()
+
 	out.clusterInfoList = make([]*framework.ClusterInfo, 0, len(clusters))
 	for _, cluster := range clusters {
 		cloned := cluster.DeepCopy()

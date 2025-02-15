@@ -1,3 +1,19 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package replica
 
 import (
@@ -12,21 +28,10 @@ import (
 	listcorev1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/klog/v2"
 
-	"github.com/karmada-io/karmada/pkg/estimator/server/nodes"
 	"github.com/karmada-io/karmada/pkg/util"
 	"github.com/karmada-io/karmada/pkg/util/helper"
 	utilworkload "github.com/karmada-io/karmada/pkg/util/lifted"
 )
-
-// NodeMaxAvailableReplica calculates max available replicas of a node, based on
-// the pods assigned to the node and the request resource of the replica.
-func NodeMaxAvailableReplica(node *corev1.Node, pods []*corev1.Pod, request corev1.ResourceList) (int32, error) {
-	ni := nodes.NewNodeInfo(node)
-	if err := ni.AssignedPodRequest(pods); err != nil {
-		return 0, err
-	}
-	return int32(ni.MaxReplicaDivided(request)), nil
-}
 
 // ListerWrapper is a wrapper which wraps the pod lister and replicaset lister.
 type ListerWrapper struct {
@@ -44,8 +49,8 @@ func GetUnschedulablePodsOfWorkload(unstructObj *unstructured.Unstructured, thre
 	// and the other is which owns Pod directly.
 	switch unstructObj.GetKind() {
 	case util.DeploymentKind:
-		deployment, err := helper.ConvertToDeployment(unstructObj)
-		if err != nil {
+		deployment := &appsv1.Deployment{}
+		if err := helper.ConvertToTypedObject(unstructObj, deployment); err != nil {
 			return 0, fmt.Errorf("failed to convert ReplicaSet from unstructured object: %v", err)
 		}
 		pods, err := listDeploymentPods(deployment, listers)

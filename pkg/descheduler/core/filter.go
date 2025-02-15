@@ -1,15 +1,27 @@
+/*
+Copyright 2022 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package core
 
 import (
-	"encoding/json"
-
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/klog/v2"
 
-	policyv1alpha1 "github.com/karmada-io/karmada/pkg/apis/policy/v1alpha1"
 	workv1alpha2 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha2"
-	"github.com/karmada-io/karmada/pkg/util"
 	"github.com/karmada-io/karmada/pkg/util/helper"
 )
 
@@ -41,15 +53,13 @@ func validateGVK(reference *workv1alpha2.ObjectReference) bool {
 }
 
 func validatePlacement(binding *workv1alpha2.ResourceBinding) bool {
-	// Check whether the policy allows rescheduling.
-	appliedPlacement := util.GetLabelValue(binding.Annotations, util.PolicyPlacementAnnotation)
-	if len(appliedPlacement) == 0 {
+	placement, err := helper.GetAppliedPlacement(binding.Annotations)
+	if err != nil {
+		klog.ErrorS(err, "Failed to get applied placement when validating", "ResourceBinding", klog.KObj(binding))
 		return false
 	}
-	placement := &policyv1alpha1.Placement{}
-	if err := json.Unmarshal([]byte(appliedPlacement), placement); err != nil {
-		klog.ErrorS(err, "Failed to unmarshal placement when validating", "ResourceBinding", klog.KObj(binding))
+	if placement == nil {
 		return false
 	}
-	return helper.IsReplicaDynamicDivided(placement.ReplicaScheduling)
+	return helper.IsReplicaDynamicDivided(placement)
 }

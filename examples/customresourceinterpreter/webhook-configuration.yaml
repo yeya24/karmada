@@ -6,12 +6,12 @@ metadata:
 webhooks:
   - name: workloads.example.com
     rules:
-      - operations: [ "InterpretReplica","ReviseReplica","Retain","AggregateStatus" ]
+      - operations: [ "InterpretReplica","ReviseReplica","Retain","AggregateStatus", "InterpretHealth", "InterpretStatus", "InterpretDependency" ]
         apiGroups: [ "workload.example.io" ]
         apiVersions: [ "v1alpha1" ]
         kinds: [ "Workload" ]
     clientConfig:
-      url: https://karmada-interpreter-webhook-example.karmada-system.svc:443/interpreter-workload
+      url: https://{{karmada-interpreter-webhook-example-svc-address}}:443/interpreter-workload
       caBundle: {{caBundle}}
     interpreterContextVersions: [ "v1alpha1" ]
     timeoutSeconds: 3

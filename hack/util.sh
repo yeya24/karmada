@@ -1,4 +1,18 @@
 #!/usr/bin/env bash
+# Copyright 2021 The Karmada Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 
 set -o errexit
 set -o nounset
@@ -16,8 +30,32 @@ KARMADA_SCHEDULER_LABEL="karmada-scheduler"
 KARMADA_WEBHOOK_LABEL="karmada-webhook"
 AGENT_POD_LABEL="karmada-agent"
 INTERPRETER_WEBHOOK_EXAMPLE_LABEL="karmada-interpreter-webhook-example"
+KARMADA_SEARCH_LABEL="karmada-search"
+KARMADA_OPENSEARCH_LABEL="karmada-opensearch"
+KARMADA_OPENSEARCH_DASHBOARDS_LABEL="karmada-opensearch-dashboards"
+KARMADA_METRICS_ADAPTER_LABEL="karmada-metrics-adapter"
 
-MIN_Go_VERSION=go1.17.0
+KARMADA_GO_PACKAGE="github.com/karmada-io/karmada"
+
+MIN_GO_VERSION="go$(go list -m -f {{.GoVersion}})"
+
+DEFAULT_CLUSTER_VERSION="kindest/node:v1.31.2"
+
+KARMADA_TARGET_SOURCE=(
+  karmada-aggregated-apiserver=cmd/aggregated-apiserver
+  karmada-controller-manager=cmd/controller-manager
+  karmada-scheduler=cmd/scheduler
+  karmada-descheduler=cmd/descheduler
+  karmadactl=cmd/karmadactl
+  kubectl-karmada=cmd/kubectl-karmada
+  karmada-webhook=cmd/webhook
+  karmada-agent=cmd/agent
+  karmada-scheduler-estimator=cmd/scheduler-estimator
+  karmada-interpreter-webhook-example=examples/customresourceinterpreter/webhook
+  karmada-search=cmd/karmada-search
+  karmada-operator=operator/cmd/operator
+  karmada-metrics-adapter=cmd/metrics-adapter
+)
 
 #https://textkool.com/en/ascii-art-generator?hl=default&vl=default&font=DOS%20Rebel&text=KARMADA
 KARMADA_GREETING='
@@ -32,6 +70,16 @@ KARMADA_GREETING='
 ░░░░░   ░░░░ ░░░░░   ░░░░░ ░░░░░   ░░░░░ ░░░░░     ░░░░░ ░░░░░   ░░░░░ ░░░░░░░░░░   ░░░░░   ░░░░░
 ------------------------------------------------------------------------------------------------------
 '
+
+function util::get_target_source() {
+  local target=$1
+  for s in "${KARMADA_TARGET_SOURCE[@]}"; do
+    if [[ "$s" == ${target}=* ]]; then
+      echo "${s##${target}=}"
+      return
+    fi
+  done
+}
 
 # This function installs a Go tools by 'go install' command.
 # Parameters:
@@ -64,15 +112,30 @@ function util::cmd_must_exist {
     fi
 }
 
+function util::verify_docker {
+  if ! docker ps -q >/dev/null 2>&1; then
+      echo "Docker is not available, Please verify docker is installed and available"
+      exit 1
+  fi
+}
+
 function util::verify_go_version {
     local go_version
     IFS=" " read -ra go_version <<< "$(GOFLAGS='' go version)"
-    if [[ "${MIN_Go_VERSION}" != $(echo -e "${MIN_Go_VERSION}\n${go_version[2]}" | sort -s -t. -k 1,1 -k 2,2n -k 3,3n | head -n1) && "${go_version[2]}" != "devel" ]]; then
+    if [[ "${MIN_GO_VERSION}" != $(echo -e "${MIN_GO_VERSION}\n${go_version[2]}" | sort -s -t. -k 1,1 -k 2,2n -k 3,3n | head -n1) && "${go_version[2]}" != "devel" ]]; then
       echo "Detected go version: ${go_version[*]}."
-      echo "Karmada requires ${MIN_Go_VERSION} or greater."
-      echo "Please install ${MIN_Go_VERSION} or later."
+      echo "Karmada requires ${MIN_GO_VERSION} or greater."
+      echo "Please install ${MIN_GO_VERSION} or later."
       exit 1
     fi
+}
+
+function util::verify_ip_address {
+  IPADDRESS=${1}
+  if [[ ! "${IPADDRESS}" =~ ^(([1-9]?[0-9]|1[0-9][0-9]|2([0-4][0-9]|5[0-5]))\.){3}([1-9]?[0-9]|1[0-9][0-9]|2([0-4][0-9]|5[0-5]))$ ]]; then
+    echo -e "\nError: invalid IP address"
+    exit 1
+  fi
 }
 
 # util::cmd_must_exist_cfssl downloads cfssl/cfssljson if they do not already exist in PATH
@@ -134,18 +197,24 @@ function util::install_kubectl {
     fi
 }
 
+# util::install_helm will install the helm command
+function util::install_helm {
+    curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+}
+
 # util::create_signing_certkey creates a CA, args are sudo, dest-dir, ca-id, purpose
 function util::create_signing_certkey {
     local sudo=$1
     local dest_dir=$2
     local id=$3
-    local purpose=$4
+    local cn=$4
+    local purpose=$5
     OPENSSL_BIN=$(command -v openssl)
     # Create ca
     ${sudo} /usr/bin/env bash -e <<EOF
-    rm -f "${dest_dir}/${id}-ca.crt" "${dest_dir}/${id}-ca.key"
-    ${OPENSSL_BIN} req -x509 -sha256 -new -nodes -days 365 -newkey rsa:2048 -keyout "${dest_dir}/${id}-ca.key" -out "${dest_dir}/${id}-ca.crt" -subj "/C=xx/ST=x/L=x/O=x/OU=x/CN=ca/emailAddress=x/"
-    echo '{"signing":{"default":{"expiry":"43800h","usages":["signing","key encipherment",${purpose}]}}}' > "${dest_dir}/${id}-ca-config.json"
+    rm -f "${dest_dir}/${id}.crt" "${dest_dir}/${id}.key"
+    ${OPENSSL_BIN} req -x509 -sha256 -new -nodes -days 3650 -newkey rsa:3072 -keyout "${dest_dir}/${id}.key" -out "${dest_dir}/${id}.crt" -subj "/CN=${cn}/"
+    echo '{"signing":{"default":{"expiry":"43800h","usages":["signing","key encipherment",${purpose}]}}}' > "${dest_dir}/${id}-config.json"
 EOF
 }
 
@@ -156,9 +225,10 @@ function util::create_certkey {
     local ca=$3
     local id=$4
     local cn=${5:-$4}
+    local og=$6
     local hosts=""
     local SEP=""
-    shift 5
+    shift 6
     while [[ -n "${1:-}" ]]; do
         hosts+="${SEP}\"$1\""
         SEP=","
@@ -166,23 +236,35 @@ function util::create_certkey {
     done
     ${sudo} /usr/bin/env bash -e <<EOF
     cd ${dest_dir}
-    echo '{"CN":"${cn}","hosts":[${hosts}],"names":[{"O":"system:masters"}],"key":{"algo":"rsa","size":2048}}' | ${CFSSL_BIN} gencert -ca=${ca}.crt -ca-key=${ca}.key -config=${ca}-config.json - | ${CFSSLJSON_BIN} -bare ${id}
+    echo '{"CN":"${cn}","hosts":[${hosts}],"names":[{"O":"${og}"}],"key":{"algo":"rsa","size":3072}}' | ${CFSSL_BIN} gencert -ca=${ca}.crt -ca-key=${ca}.key -config=${ca}-config.json - | ${CFSSLJSON_BIN} -bare ${id}
     mv "${id}-key.pem" "${id}.key"
     mv "${id}.pem" "${id}.crt"
     rm -f "${id}.csr"
 EOF
 }
 
+# util::create_key_pair generates a new public and private key pair.
+function util::create_key_pair {
+  local sudo=$1
+  local dest_dir=$2
+  local name=$3
+  ${sudo} /usr/bin/env bash -e <<EOF
+  cd ${dest_dir}
+  openssl genrsa -out ${name}.key 3072
+  openssl rsa -in ${name}.key -pubout -out ${name}.pub
+EOF
+}
+
 # util::append_client_kubeconfig creates a new context including a cluster and a user to the existed kubeconfig file
 function util::append_client_kubeconfig {
     local kubeconfig_path=$1
-    local client_certificate_file=$2
-    local client_key_file=$3
-    local api_host=$4
-    local api_port=$5
+    local ca_file=$2
+    local client_certificate_file=$3
+    local client_key_file=$4
+    local server=$5
     local client_id=$6
     local token=${7:-}
-    kubectl config set-cluster "${client_id}" --server=https://"${api_host}:${api_port}" --insecure-skip-tls-verify=true --kubeconfig="${kubeconfig_path}"
+    kubectl config set-cluster "${client_id}" --server="${server}" --embed-certs --certificate-authority="${ca_file}" --kubeconfig="${kubeconfig_path}"
     kubectl config set-credentials "${client_id}" --token="${token}" --client-certificate="${client_certificate_file}" --client-key="${client_key_file}" --embed-certs=true --kubeconfig="${kubeconfig_path}"
     kubectl config set-context "${client_id}" --cluster="${client_id}" --user="${client_id}" --kubeconfig="${kubeconfig_path}"
 }
@@ -276,46 +358,86 @@ function util::wait_file_exist() {
     return 1
 }
 
+# util::wait_context_exist checks if the specific context exists in kubeconfig, if not, wait until timeout
+function util::wait_context_exist() {
+    local context_name=${1}
+    local file_path=${2}
+    local timeout=${3}
+    local error_msg="[ERROR] Timeout waiting for context exist ${context_name}"
+    for ((time=0; time<${timeout}; time++)); do
+        if [[ `kubectl config get-contexts ${context_name} --kubeconfig=${file_path}` =~ ${context_name} ]]; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo -e "\n${error_msg}"
+    return 1
+}
+
 # util::wait_pod_ready waits for pod state becomes ready until timeout.
-# Parmeters:
-#  - $1: pod label, such as "app=etcd"
-#  - $2: pod namespace, such as "karmada-system"
-#  - $3: time out, such as "200s"
+# Parameters:
+#  - $1: k8s context name, such as "karmada-apiserver"
+#  - $2: pod label, such as "app=etcd"
+#  - $3: pod namespace, such as "karmada-system"
+#  - $4: time out, such as "200s"
 function util::wait_pod_ready() {
-    local pod_label=$1
-    local pod_namespace=$2
+    local context_name=$1
+    local pod_label=$2
+    local pod_namespace=$3
 
     echo "wait the $pod_label ready..."
     set +e
-    util::kubectl_with_retry wait --for=condition=Ready --timeout=30s pods -l app=${pod_label} -n ${pod_namespace}
+    util::kubectl_with_retry --context="$context_name" wait --for=condition=Ready --timeout=30s pods -l app=${pod_label} -n ${pod_namespace}
     ret=$?
     set -e
     if [ $ret -ne 0 ];then
       echo "kubectl describe info:"
-      kubectl describe pod -l app=${pod_label} -n ${pod_namespace}
+      kubectl --context="$context_name" describe pod -l app=${pod_label} -n ${pod_namespace}
       echo "kubectl logs info:"
-      kubectl logs -l app=${pod_label} -n ${pod_namespace}
+      kubectl --context="$context_name" logs -l app=${pod_label} -n ${pod_namespace}
     fi
     return ${ret}
 }
 
 # util::wait_apiservice_ready waits for apiservice state becomes Available until timeout.
-# Parmeters:
-#  - $1: apiservice label, such as "app=etcd"
+# Parameters:
+#  - $1: k8s context name, such as "karmada-apiserver"
+#  - $2: apiservice label, such as "app=etcd"
 #  - $3: time out, such as "200s"
 function util::wait_apiservice_ready() {
-    local apiservice_label=$1
+    local context_name=$1
+    local apiservice_label=$2
 
     echo "wait the $apiservice_label Available..."
     set +e
-    util::kubectl_with_retry wait --for=condition=Available --timeout=30s apiservices -l app=${apiservice_label}
+    util::kubectl_with_retry --context="$context_name" wait --for=condition=Available --timeout=30s apiservices -l app=${apiservice_label}
     ret=$?
     set -e
     if [ $ret -ne 0 ];then
       echo "kubectl describe info:"
-      kubectl describe apiservices -l app=${apiservice_label}
+      kubectl --context="$context_name" describe apiservices -l app=${apiservice_label}
     fi
     return ${ret}
+}
+
+# util::wait_cluster_ready waits for cluster state becomes ready until timeout.
+# Parameters:
+#  - $1: context name, such as "karmada-apiserver"
+#  - $2: cluster name, such as "member1"
+function util:wait_cluster_ready() {
+  local context_name=$1
+  local cluster_name=$2
+
+  echo "wait the cluster $cluster_name onBoard..."
+  set +e
+  util::kubectl_with_retry --context="$context_name" wait --for=condition=Ready --timeout=60s clusters "${cluster_name}"
+  ret=$?
+  set -e
+  if [ $ret -ne 0 ]; then
+    echo "kubectl describe info:"
+    kubectl --context="$context_name" describe clusters "${cluster_name}"
+  fi
+  return ${ret}
 }
 
 # util::kubectl_with_retry will retry if execute kubectl command failed
@@ -339,9 +461,31 @@ function util::kubectl_with_retry() {
     return ${ret}
 }
 
+# util::delete_necessary_resources deletes clusters(karmada-host, member1, member2 and member3) and related resources directly
+# util::delete_necessary_resources actually do three things: delete cluster、remove kubeconfig、record delete log
+# Parameters:
+#  - $1: KUBECONFIG files of clusters, separated by ",", such as "~/.kube/karmada.config,~/.kube/members.config"
+#  - $2: clusters, separated by ",", such as "karmada-host,member1"
+#  - $3: log file path, such as "/tmp/karmada/"
+function util::delete_necessary_resources() {
+  local config_files=${1}
+  local clusters=${2}
+  local log_path=${3}
+
+  local log_file="${log_path}"/delete-necessary-resources.log
+  rm -f ${log_file}
+  mkdir -p ${log_path}
+
+  local config_file_arr=$(echo ${config_files}| tr ',' ' ')
+  local cluster_arr=$(echo ${clusters}| tr ',' ' ')
+  kind delete clusters ${cluster_arr} >> "${log_file}" 2>&1
+  rm -f ${config_file_arr}
+  echo "Deleted all necessary clusters and the log file is in ${log_file}"
+}
+
 # util::create_cluster creates a kubernetes cluster
 # util::create_cluster creates a kind cluster and don't wait for control plane node to be ready.
-# Parmeters:
+# Parameters:
 #  - $1: cluster name, such as "host"
 #  - $2: KUBECONFIG file, such as "/var/run/host.config"
 #  - $3: node docker image to use for booting the cluster, such as "kindest/node:v1.19.1"
@@ -356,8 +500,9 @@ function util::create_cluster() {
   mkdir -p ${log_path}
   rm -rf "${log_path}/${cluster_name}.log"
   rm -f "${kubeconfig}"
-  nohup kind delete cluster --name="${cluster_name}" >> "${log_path}"/"${cluster_name}".log 2>&1 && kind create cluster --name "${cluster_name}" --kubeconfig="${kubeconfig}" --image="${kind_image}" --config="${cluster_config}" >> "${log_path}"/"${cluster_name}".log 2>&1 &
-  echo "Creating cluster ${cluster_name}"
+
+  nohup kind create cluster --name "${cluster_name}" --kubeconfig="${kubeconfig}" --image="${kind_image}" --config="${cluster_config}" >> "${log_path}"/"${cluster_name}".log 2>&1 &
+  echo "Creating cluster ${cluster_name} and the log file is in ${log_path}/${cluster_name}.log"
 }
 
 # This function returns the IP address of a docker instance
@@ -420,20 +565,22 @@ function util::get_apiserver_ip_from_kubeconfig(){
 
 # This function deploys webhook configuration
 # Parameters:
-#  - $1: CA file
-#  - $2: configuration file
+#  - $1: k8s context name
+#  - $2: CA file
+#  - $3: configuration file
 # Note:
 #   Deprecated: should be removed after helm get on board.
 function util::deploy_webhook_configuration() {
-  local ca_file=$1
-  local conf=$2
+  local context_name=$1
+  local ca_file=$2
+  local conf=$3
 
   local ca_string=$(cat ${ca_file} | base64 | tr "\n" " "|sed s/[[:space:]]//g)
 
   local temp_path=$(mktemp -d)
   cp -rf "${conf}" "${temp_path}/temp.yaml"
   sed -i'' -e "s/{{caBundle}}/${ca_string}/g" "${temp_path}/temp.yaml"
-  kubectl apply -f "${temp_path}/temp.yaml"
+  kubectl --context="$context_name" apply -f "${temp_path}/temp.yaml"
   rm -rf "${temp_path}"
 }
 
@@ -441,29 +588,33 @@ function util::fill_cabundle() {
   local ca_file=$1
   local conf=$2
 
-  local ca_string=$(sudo cat ${ca_file} | base64 | tr "\n" " "|sed s/[[:space:]]//g)
+  local ca_string=$(cat "${ca_file}" | base64 | tr "\n" " "|sed s/[[:space:]]//g)
   sed -i'' -e "s/{{caBundle}}/${ca_string}/g" "${conf}"
 }
 
 # util::wait_service_external_ip give a service external ip when it is ready, if not, wait until timeout
 # Parameters:
-#  - $1: service name in k8s
-#  - $2: namespace
+#  - $1: context name in k8s
+#  - $2: service name in k8s
+#  - $3: namespace
 SERVICE_EXTERNAL_IP=''
 function util::wait_service_external_ip() {
-  local service_name=$1
-  local namespace=$2
+  local context_name=$1
+  local service_name=$2
+  local namespace=$3
   local external_ip
   local tmp
   for tmp in {1..30}; do
     set +e
-    external_host=$(kubectl get service "${service_name}" -n "${namespace}" --template="{{range .status.loadBalancer.ingress}}{{.hostname}} {{end}}" | xargs)
-    external_ip=$(kubectl get service "${service_name}" -n "${namespace}" --template="{{range .status.loadBalancer.ingress}}{{.ip}} {{end}}" | xargs)
+    ## if .status.loadBalancer does not have `ingress` field, return "".
+    ## if .status.loadBalancer has `ingress` field but one of `ingress` field does not have `hostname` or `ip` field, return "<no value>".
+    external_host=$(kubectl --context="$context_name" get service "${service_name}" -n "${namespace}" --template="{{range .status.loadBalancer.ingress}}{{.hostname}} {{end}}" | xargs)
+    external_ip=$(kubectl --context="$context_name" get service "${service_name}" -n "${namespace}" --template="{{range .status.loadBalancer.ingress}}{{.ip}} {{end}}" | xargs)
     set -e
-    if [[ ! -z "$external_host" ]]; then # Compatibility with hostname, such as AWS
+    if [[ ! -z "$external_host" && "$external_host" != "<no value>" ]]; then # Compatibility with hostname, such as AWS
       external_ip=$external_host
     fi
-    if [[ -z "$external_ip" ]]; then
+    if [[ -z "$external_ip" || "$external_ip" = "<no value>" ]]; then
       echo "wait the external ip of ${service_name} ready..."
       sleep 6
       continue
@@ -545,13 +696,102 @@ function util::get_macos_ipaddress() {
     fi
     read -r -p "${tips_msg}" MAC_NIC_IPADDRESS
     MAC_NIC_IPADDRESS=${MAC_NIC_IPADDRESS:-$tmp_ip}
-    if [[ "${MAC_NIC_IPADDRESS}" =~ ^(([1-9]?[0-9]|1[0-9][0-9]|2([0-4][0-9]|5[0-5]))\.){3}([1-9]?[0-9]|1[0-9][0-9]|2([0-4][0-9]|5[0-5]))$ ]]; then
-      echo "Using IP address: ${MAC_NIC_IPADDRESS}"
-    else
-      echo -e "\nError: you input an invalid IP address"
-      exit 1
-    fi
+    util::verify_ip_address "${MAC_NIC_IPADDRESS}"
+    echo "Using IP address: ${MAC_NIC_IPADDRESS}"
   else # non-macOS
     MAC_NIC_IPADDRESS=${MAC_NIC_IPADDRESS:-}
   fi
+}
+
+function util::get_version() {
+  git describe --tags --dirty
+}
+
+function util::version_ldflags() {
+  # Git information
+  GIT_VERSION=$(util::get_version)
+  GIT_COMMIT_HASH=$(git rev-parse HEAD)
+  if git_status=$(git status --porcelain 2>/dev/null) && [[ -z ${git_status} ]]; then
+    GIT_TREESTATE="clean"
+  else
+    GIT_TREESTATE="dirty"
+  fi
+  BUILDDATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+  LDFLAGS="-X github.com/karmada-io/karmada/pkg/version.gitVersion=${GIT_VERSION} \
+                        -X github.com/karmada-io/karmada/pkg/version.gitCommit=${GIT_COMMIT_HASH} \
+                        -X github.com/karmada-io/karmada/pkg/version.gitTreeState=${GIT_TREESTATE} \
+                        -X github.com/karmada-io/karmada/pkg/version.buildDate=${BUILDDATE}"
+  echo $LDFLAGS
+}
+
+# util::create_gopath_tree create the GOPATH tree
+# Parameters:
+#  - $1: the root path of repo
+#  - $2: go path
+function util:create_gopath_tree() {
+  local repo_root=$1
+  local go_path=$2
+
+  local karmada_pkg_dir="${go_path}/src/${KARMADA_GO_PACKAGE}"
+  local go_pkg_dir=$(dirname "${karmada_pkg_dir}")
+
+  mkdir -p "${go_pkg_dir}"
+
+  if [[ ! -e "${go_pkg_dir}" || "$(readlink "${go_pkg_dir}")" != "${repo_root}" ]]; then
+    ln -snf "${repo_root}" "${karmada_pkg_dir}"
+  fi
+}
+
+function util:host_platform() {
+  echo "$(go env GOHOSTOS)/$(go env GOHOSTARCH)"
+}
+
+# util::set_mirror_registry_for_china_mainland will do proxy setting in China mainland
+# Parameters:
+#  - $1: the root path of repo
+function util::set_mirror_registry_for_china_mainland() {
+  local repo_root=${1}
+  export GOPROXY=https://goproxy.cn,direct # set domestic go proxy
+  # set mirror registry of registry.k8s.io
+  registry_files=( # Yaml files that contain image host 'registry.k8s.io' need to be replaced
+    "artifacts/deploy/karmada-etcd.yaml"
+    "artifacts/deploy/karmada-apiserver.yaml"
+    "artifacts/deploy/kube-controller-manager.yaml"
+  )
+  for registry_file in "${registry_files[@]}"; do
+    sed -i'' -e "s#registry.k8s.io#registry.aliyuncs.com/google_containers#g" ${repo_root}/${registry_file}
+  done
+
+  # set mirror registry in the dockerfile of components of karmada
+  dockerfile_list=( # Dockerfile files need to be replaced
+    "cluster/images/Dockerfile"
+    "cluster/images/buildx.Dockerfile"
+  )
+  for dockerfile in "${dockerfile_list[@]}"; do
+    grep 'mirrors.ustc.edu.cn' ${repo_root}/${dockerfile} > /dev/null || sed -i'' -e "/FROM alpine:/a\\
+RUN echo -e http://mirrors.ustc.edu.cn/alpine/v3.21/main/ > /etc/apk/repositories" ${repo_root}/${dockerfile}
+  done
+}
+
+# util::wait_nodes_taint_disappear will wait for all the nodes' taint to disappear
+# Parameters:
+#  - timeout: Timeout in seconds.
+#  - kubeconfig_path: The path of kubeconfig.
+# Returns:
+#  1 if the condition is not met before the timeout, else 0
+function util::wait_nodes_taint_disappear() {
+  local timeout=${1}
+  local kubeconfig_path=${2}
+
+  timeout "${timeout}" bash <<EOF && return 0
+    while true
+    do
+      taints=\$(kubectl get nodes --kubeconfig=${kubeconfig_path} -o=jsonpath="{.items[*].spec.taints}")
+      if [ -z \$taints ]; then
+        exit
+      fi
+    done
+EOF
+  echo "Timeout for nodes' taint to disappear"
+  return 1
 }

@@ -1,11 +1,27 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package server
 
 import (
 	"context"
-	"fmt"
 	"reflect"
 	"testing"
 
+	"google.golang.org/grpc/metadata"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -18,6 +34,7 @@ import (
 
 	"github.com/karmada-io/karmada/cmd/scheduler-estimator/app/options"
 	"github.com/karmada-io/karmada/pkg/estimator/pb"
+	"github.com/karmada-io/karmada/pkg/util"
 	testhelper "github.com/karmada-io/karmada/test/helper"
 )
 
@@ -227,12 +244,11 @@ func TestAccurateSchedulerEstimatorServer_MaxAvailableReplicas(t *testing.T) {
 				},
 			}
 
-			es := NewEstimatorServer(fake.NewSimpleClientset(tt.objs...), dynamicClient, discoveryClient, opt, ctx.Done())
+			es, _ := NewEstimatorServer(fake.NewSimpleClientset(tt.objs...), dynamicClient, discoveryClient, opt, ctx.Done())
 
 			es.informerFactory.Start(ctx.Done())
-			if !es.waitForCacheSync(ctx.Done()) {
-				t.Fatalf("MaxAvailableReplicas() error = %v, wantErr %v", fmt.Errorf("failed to wait for cache sync"), tt.wantErr)
-			}
+			es.informerFactory.WaitForCacheSync(ctx.Done())
+			es.informerManager.WaitForCacheSync()
 
 			gotResponse, err := es.MaxAvailableReplicas(ctx, tt.args.request)
 			if (err != nil) != tt.wantErr {
@@ -241,6 +257,158 @@ func TestAccurateSchedulerEstimatorServer_MaxAvailableReplicas(t *testing.T) {
 			}
 			if !reflect.DeepEqual(gotResponse, tt.wantResponse) {
 				t.Errorf("MaxAvailableReplicas() gotResponse = %v, want %v", gotResponse, tt.wantResponse)
+			}
+		})
+	}
+}
+
+func BenchmarkAccurateSchedulerEstimatorServer_MaxAvailableReplicas(b *testing.B) {
+	opt := &options.Options{
+		ClusterName: "fake",
+	}
+	type args struct {
+		request *pb.MaxAvailableReplicasRequest
+	}
+	tests := []struct {
+		name         string
+		allNodesNum  int
+		allPodsNum   int
+		nodeTemplate *corev1.Node
+		podTemplate  *corev1.Pod
+		args         args
+	}{
+		{
+			name:         "500 nodes and 10,000 pods without affinity and tolerations",
+			allNodesNum:  500,
+			allPodsNum:   10000,
+			nodeTemplate: testhelper.NewNode("", 100*testhelper.ResourceUnitCPU, 200*testhelper.ResourceUnitMem, 110*testhelper.ResourceUnitPod, 200*testhelper.ResourceUnitEphemeralStorage),
+			podTemplate:  testhelper.NewPodWithRequest("", "", 2*testhelper.ResourceUnitCPU, 3*testhelper.ResourceUnitMem, 4*testhelper.ResourceUnitEphemeralStorage),
+			// request 1 cpu, 2 mem
+			args: args{
+				request: &pb.MaxAvailableReplicasRequest{
+					Cluster: "fake",
+					ReplicaRequirements: pb.ReplicaRequirements{
+						ResourceRequest: testhelper.NewResourceList(1*testhelper.ResourceUnitCPU, 2*testhelper.ResourceUnitMem, testhelper.ResourceUnitZero),
+					},
+				},
+			},
+		},
+		{
+			name:         "5000 nodes and 100,000 pods without affinity and tolerations",
+			allNodesNum:  5000,
+			allPodsNum:   100000,
+			nodeTemplate: testhelper.NewNode("", 100*testhelper.ResourceUnitCPU, 200*testhelper.ResourceUnitMem, 110*testhelper.ResourceUnitPod, 200*testhelper.ResourceUnitEphemeralStorage),
+			podTemplate:  testhelper.NewPodWithRequest("", "", 2*testhelper.ResourceUnitCPU, 3*testhelper.ResourceUnitMem, 4*testhelper.ResourceUnitEphemeralStorage),
+			// request 1 cpu, 2 mem
+			args: args{
+				request: &pb.MaxAvailableReplicasRequest{
+					Cluster: "fake",
+					ReplicaRequirements: pb.ReplicaRequirements{
+						ResourceRequest: testhelper.NewResourceList(1*testhelper.ResourceUnitCPU, 2*testhelper.ResourceUnitMem, testhelper.ResourceUnitZero),
+					},
+				},
+			},
+		},
+		{
+			name:         "5000 nodes and 100,000 pods with taint and tolerations",
+			allNodesNum:  5000,
+			allPodsNum:   100000,
+			nodeTemplate: testhelper.MakeNodeWithTaints("", 100*testhelper.ResourceUnitCPU, 200*testhelper.ResourceUnitMem, 110*testhelper.ResourceUnitPod, 200*testhelper.ResourceUnitEphemeralStorage, []corev1.Taint{{Key: "key1", Value: "value1", Effect: corev1.TaintEffectNoSchedule}}),
+			podTemplate:  testhelper.NewPodWithRequest("", "", 2*testhelper.ResourceUnitCPU, 3*testhelper.ResourceUnitMem, 4*testhelper.ResourceUnitEphemeralStorage),
+			// request 1 cpu, 2 mem
+			args: args{
+				request: &pb.MaxAvailableReplicasRequest{
+					Cluster: "fake",
+					ReplicaRequirements: pb.ReplicaRequirements{
+						NodeClaim: &pb.NodeClaim{
+							Tolerations: []corev1.Toleration{
+								{Key: "key1", Operator: corev1.TolerationOpEqual, Value: "value1"},
+							},
+						},
+						ResourceRequest: testhelper.NewResourceList(1*testhelper.ResourceUnitCPU, 2*testhelper.ResourceUnitMem, testhelper.ResourceUnitZero),
+					},
+				},
+			},
+		},
+		{
+			name:         "5000 nodes and 100,000 pods with node affinity and tolerations",
+			allNodesNum:  5000,
+			allPodsNum:   100000,
+			nodeTemplate: testhelper.MakeNodeWithLabels("", 100*testhelper.ResourceUnitCPU, 200*testhelper.ResourceUnitMem, 110*testhelper.ResourceUnitPod, 200*testhelper.ResourceUnitEphemeralStorage, map[string]string{"a": "1"}),
+			podTemplate:  testhelper.NewPodWithRequest("", "", 2*testhelper.ResourceUnitCPU, 3*testhelper.ResourceUnitMem, 4*testhelper.ResourceUnitEphemeralStorage),
+			// request 1 cpu, 2 mem
+			args: args{
+				request: &pb.MaxAvailableReplicasRequest{
+					Cluster: "fake",
+					ReplicaRequirements: pb.ReplicaRequirements{
+						NodeClaim: &pb.NodeClaim{
+							NodeAffinity: &corev1.NodeSelector{
+								NodeSelectorTerms: []corev1.NodeSelectorTerm{
+									{
+										MatchExpressions: []corev1.NodeSelectorRequirement{
+											{
+												Key:      "a",
+												Operator: corev1.NodeSelectorOpGt,
+												Values:   []string{"0"},
+											},
+										},
+									},
+								},
+							},
+							Tolerations: []corev1.Toleration{
+								{Key: "key1", Operator: corev1.TolerationOpEqual, Value: "value1"},
+							},
+						},
+						ResourceRequest: testhelper.NewResourceList(1*testhelper.ResourceUnitCPU, 2*testhelper.ResourceUnitMem, testhelper.ResourceUnitZero),
+					},
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		b.Run(tt.name, func(b *testing.B) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			ctx = metadata.NewIncomingContext(ctx, metadata.Pairs(string(util.ContextKeyObject), "fake"))
+
+			gvrToListKind := map[schema.GroupVersionResource]string{
+				{Group: "apps", Version: "v1", Resource: "deployments"}: "DeploymentList",
+			}
+			dynamicClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), gvrToListKind)
+			discoveryClient := &discoveryfake.FakeDiscovery{
+				Fake: &coretesting.Fake{},
+			}
+			discoveryClient.Resources = []*metav1.APIResourceList{
+				{
+					GroupVersion: appsv1.SchemeGroupVersion.String(),
+					APIResources: []metav1.APIResource{
+						{Name: "deployments", Namespaced: true, Kind: "Deployment"},
+					},
+				},
+			}
+			nodes, pods := testhelper.MakeNodesAndPods(tt.allNodesNum, tt.allPodsNum, tt.nodeTemplate, tt.podTemplate)
+			objs := make([]runtime.Object, 0, len(nodes)+len(pods))
+			for _, node := range nodes {
+				objs = append(objs, node)
+			}
+			for _, pod := range pods {
+				objs = append(objs, pod)
+			}
+
+			es, _ := NewEstimatorServer(fake.NewSimpleClientset(objs...), dynamicClient, discoveryClient, opt, ctx.Done())
+
+			es.informerFactory.Start(ctx.Done())
+			es.informerFactory.WaitForCacheSync(ctx.Done())
+			es.informerManager.WaitForCacheSync()
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, err := es.MaxAvailableReplicas(ctx, tt.args.request)
+				if err != nil {
+					b.Fatalf("MaxAvailableReplicas() error = %v", err)
+					return
+				}
 			}
 		})
 	}

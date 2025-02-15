@@ -1,39 +1,41 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package main
 
 import (
 	"os"
 
-	// Note that Kubernetes registers workqueue metrics to default prometheus Registry. And the registry will be
-	// initialized by the package 'k8s.io/apiserver/pkg/server'.
-	// See https://github.com/kubernetes/kubernetes/blob/f61ed439882e34d9dad28b602afdc852feb2337a/staging/src/k8s.io/component-base/metrics/prometheus/workqueue/metrics.go#L25
-	// But the controller-runtime registers workqueue metrics to its own Registry instead of default prometheus Registry.
-	// See https://github.com/kubernetes-sigs/controller-runtime/blob/4d10a0615b11507451ecb58bfd59f0f6ef313a29/pkg/metrics/workqueue.go#L24-L26
-	// However, global workqueue metrics factory will be only initialized once.
-	// See https://github.com/kubernetes/kubernetes/blob/f61ed439882e34d9dad28b602afdc852feb2337a/staging/src/k8s.io/client-go/util/workqueue/metrics.go#L257-L261
-	// So this package should be initialized before 'k8s.io/apiserver/pkg/server', thus the internal registry of
-	// controller-runtime could be set first.
-	_ "sigs.k8s.io/controller-runtime/pkg/metrics"
-
-	apiserver "k8s.io/apiserver/pkg/server"
-	"k8s.io/component-base/logs"
+	"k8s.io/component-base/cli"
+	_ "k8s.io/component-base/logs/json/register" // for JSON log format registration
+	"k8s.io/klog/v2"
+	controllerruntime "sigs.k8s.io/controller-runtime"
 
 	"github.com/karmada-io/karmada/cmd/agent/app"
 )
 
 func main() {
-	if err := runAgentCmd(); err != nil {
-		os.Exit(1)
-	}
-}
-
-func runAgentCmd() error {
-	logs.InitLogs()
-	defer logs.FlushLogs()
-
-	ctx := apiserver.SetupSignalContext()
-	if err := app.NewAgentCommand(ctx).Execute(); err != nil {
-		return err
-	}
-
-	return nil
+	ctx := controllerruntime.SetupSignalHandler()
+	// Starting from version 0.15.0, controller-runtime expects its consumers to set a logger through log.SetLogger.
+	// If SetLogger is not called within the first 30 seconds of a binaries lifetime, it will get
+	// set to a NullLogSink and report an error. Here's to silence the "log.SetLogger(...) was never called; logs will not be displayed" error
+	// by setting a logger through log.SetLogger.
+	// More info refer to: https://github.com/karmada-io/karmada/pull/4885.
+	controllerruntime.SetLogger(klog.Background())
+	cmd := app.NewAgentCommand(ctx)
+	code := cli.Run(cmd)
+	os.Exit(code)
 }

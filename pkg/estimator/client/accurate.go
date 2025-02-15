@@ -1,12 +1,28 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package client
 
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"google.golang.org/grpc/metadata"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 
 	clusterv1alpha1 "github.com/karmada-io/karmada/pkg/apis/cluster/v1alpha1"
 	workv1alpha2 "github.com/karmada-io/karmada/pkg/apis/work/v1alpha2"
@@ -75,6 +91,8 @@ func (se *SchedulerEstimator) maxAvailableReplicas(ctx context.Context, cluster 
 	}
 	if replicaRequirements != nil {
 		req.ReplicaRequirements.ResourceRequest = replicaRequirements.ResourceRequest
+		req.ReplicaRequirements.Namespace = replicaRequirements.Namespace
+		req.ReplicaRequirements.PriorityClassName = replicaRequirements.PriorityClassName
 		if replicaRequirements.NodeClaim != nil {
 			req.ReplicaRequirements.NodeClaim = &pb.NodeClaim{
 				NodeAffinity: replicaRequirements.NodeClaim.HardNodeAffinity,
@@ -127,22 +145,18 @@ func getClusterReplicasConcurrently(parentCtx context.Context, clusters []string
 	ctx, cancel := context.WithTimeout(parentCtx, timeout)
 	defer cancel()
 
-	availableTargetClusters := make([]workv1alpha2.TargetCluster, len(clusters))
-
-	var wg sync.WaitGroup
-	errChan := make(chan error, len(clusters))
-	for i := range clusters {
-		wg.Add(1)
-		go func(idx int, cluster string) {
-			defer wg.Done()
-			replicas, err := getClusterReplicas(ctx, cluster)
+	clusterReplicas := make([]workv1alpha2.TargetCluster, len(clusters))
+	funcs := make([]func() error, len(clusters))
+	for index, cluster := range clusters {
+		localIndex, localCluster := index, cluster
+		funcs[index] = func() error {
+			replicas, err := getClusterReplicas(ctx, localCluster)
 			if err != nil {
-				errChan <- err
+				return err
 			}
-			availableTargetClusters[idx] = workv1alpha2.TargetCluster{Name: cluster, Replicas: replicas}
-		}(i, clusters[i])
+			clusterReplicas[localIndex] = workv1alpha2.TargetCluster{Name: localCluster, Replicas: replicas}
+			return nil
+		}
 	}
-	wg.Wait()
-
-	return availableTargetClusters, util.AggregateErrors(errChan)
+	return clusterReplicas, utilerrors.AggregateGoroutines(funcs...)
 }

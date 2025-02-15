@@ -1,3 +1,19 @@
+/*
+Copyright 2020 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package util
 
 import (
@@ -10,7 +26,7 @@ import (
 	kubeclient "k8s.io/client-go/kubernetes"
 )
 
-// IsNamespaceExist tells if specific already exists.
+// IsNamespaceExist tells if the namespace already exists.
 func IsNamespaceExist(client kubeclient.Interface, namespace string) (bool, error) {
 	_, err := client.CoreV1().Namespaces().Get(context.Background(), namespace, metav1.GetOptions{})
 	if err != nil {
@@ -50,13 +66,25 @@ func DeleteNamespace(client kubeclient.Interface, namespace string) error {
 // EnsureNamespaceExist makes sure that the specific namespace exist in cluster.
 // If namespace not exit, just create it.
 func EnsureNamespaceExist(client kubeclient.Interface, namespace string, dryRun bool) (*corev1.Namespace, error) {
+	return EnsureNamespaceExistWithLabels(client, namespace, dryRun, nil)
+}
+
+// EnsureNamespaceExistWithLabels makes sure that the specific namespace exist in cluster.
+// If namespace not exit, just create it with specific labels.
+func EnsureNamespaceExistWithLabels(client kubeclient.Interface, namespace string, dryRun bool, labels map[string]string) (*corev1.Namespace, error) {
 	namespaceObj := &corev1.Namespace{}
-	namespaceObj.ObjectMeta.Name = namespace
+	namespaceObj.Name = namespace
+	// Set labels for namespace.
+	if labels != nil {
+		namespaceObj.Labels = labels
+	}
 
 	if dryRun {
 		return namespaceObj, nil
 	}
 
+	// It's necessary to check if a namespace exists before creating it.
+	// Sometimes the namespace is created in advance, to give less privilege to Karmada.
 	exist, err := IsNamespaceExist(client, namespace)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check if namespace exist. namespace: %s, error: %v", namespace, err)

@@ -1,18 +1,37 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package framework
 
 import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/onsi/gomega"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -43,6 +62,17 @@ func Clusters() []*clusterv1alpha1.Cluster {
 // ClusterNames will return all member clusters' names we have.
 func ClusterNames() []string {
 	return clusterNames
+}
+
+// ClusterNamesWithSyncMode will return member clusters' names which matches the sync mode.
+func ClusterNamesWithSyncMode(mode clusterv1alpha1.ClusterSyncMode) []string {
+	res := make([]string, 0, len(clusterNames))
+	for _, cluster := range clusters {
+		if cluster.Spec.SyncMode == mode {
+			res = append(res, cluster.Name)
+		}
+	}
+	return res
 }
 
 // InitClusterInformation init the E2E test's cluster information.
@@ -135,8 +165,8 @@ func fetchClusters(client karmada.Interface) ([]*clusterv1alpha1.Cluster, error)
 	return clusters, nil
 }
 
-// fetchCluster will fetch member cluster by name.
-func fetchCluster(client karmada.Interface, clusterName string) (*clusterv1alpha1.Cluster, error) {
+// FetchCluster will fetch member cluster by name.
+func FetchCluster(client karmada.Interface, clusterName string) (*clusterv1alpha1.Cluster, error) {
 	cluster, err := client.ClusterV1alpha1().Clusters().Get(context.TODO(), clusterName, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
@@ -177,7 +207,7 @@ func newClusterClientSet(controlPlaneClient client.Client, c *clusterv1alpha1.Cl
 	}
 
 	clusterConfigPath := pullModeClusters[c.Name]
-	clusterConfig, err := clientcmd.BuildConfigFromFlags("", clusterConfigPath)
+	clusterConfig, err := LoadRESTClientConfig(clusterConfigPath, c.Name)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -192,12 +222,9 @@ func newClusterClientSet(controlPlaneClient client.Client, c *clusterv1alpha1.Cl
 
 // setClusterLabel set cluster label of E2E
 func setClusterLabel(c client.Client, clusterName string) error {
-	err := wait.PollImmediate(2*time.Second, 10*time.Second, func() (done bool, err error) {
+	err := wait.PollUntilContextTimeout(context.TODO(), 2*time.Second, 10*time.Second, true, func(ctx context.Context) (done bool, err error) {
 		clusterObj := &clusterv1alpha1.Cluster{}
-		if err := c.Get(context.TODO(), client.ObjectKey{Name: clusterName}, clusterObj); err != nil {
-			if apierrors.IsConflict(err) {
-				return false, nil
-			}
+		if err := c.Get(ctx, client.ObjectKey{Name: clusterName}, clusterObj); err != nil {
 			return false, err
 		}
 		if clusterObj.Labels == nil {
@@ -207,7 +234,7 @@ func setClusterLabel(c client.Client, clusterName string) error {
 		if clusterObj.Spec.SyncMode == clusterv1alpha1.Push {
 			clusterObj.Labels["sync-mode"] = "Push"
 		}
-		if err := c.Update(context.TODO(), clusterObj); err != nil {
+		if err := c.Update(ctx, clusterObj); err != nil {
 			if apierrors.IsConflict(err) {
 				return false, nil
 			}
@@ -216,6 +243,50 @@ func setClusterLabel(c client.Client, clusterName string) error {
 		return true, nil
 	})
 	return err
+}
+
+// UpdateClusterLabels updates cluster labels.
+func UpdateClusterLabels(client karmada.Interface, clusterName string, labels map[string]string) {
+	gomega.Eventually(func() (bool, error) {
+		cluster, err := client.ClusterV1alpha1().Clusters().Get(context.TODO(), clusterName, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+
+		if cluster.Labels == nil {
+			cluster.Labels = map[string]string{}
+		}
+		for key, value := range labels {
+			cluster.Labels[key] = value
+		}
+		_, err = client.ClusterV1alpha1().Clusters().Update(context.TODO(), cluster, metav1.UpdateOptions{})
+		if err != nil {
+			return false, err
+		}
+		return true, nil
+	}, pollTimeout, pollInterval).Should(gomega.Equal(true))
+}
+
+// DeleteClusterLabels deletes cluster labels if it exists.
+func DeleteClusterLabels(client karmada.Interface, clusterName string, labels map[string]string) {
+	gomega.Eventually(func() (bool, error) {
+		cluster, err := client.ClusterV1alpha1().Clusters().Get(context.TODO(), clusterName, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+
+		if cluster.Labels == nil {
+			return true, nil
+		}
+		for key := range labels {
+			delete(cluster.Labels, key)
+		}
+		_, err = client.ClusterV1alpha1().Clusters().Update(context.TODO(), cluster, metav1.UpdateOptions{})
+		if err != nil {
+			return false, err
+		}
+		return true, nil
+	}, pollTimeout, pollInterval).Should(gomega.Equal(true))
 }
 
 // GetClusterNamesFromClusters will get Clusters' names form Clusters Object.
@@ -235,5 +306,62 @@ func WaitClusterFitWith(c client.Client, clusterName string, fit func(cluster *c
 			return false, err
 		}
 		return fit(currentCluster), nil
+	}, pollTimeout, pollInterval).Should(gomega.Equal(true))
+}
+
+// LoadRESTClientConfig creates a rest.Config using the passed kubeconfig. If context is empty, current context in kubeconfig will be used.
+func LoadRESTClientConfig(kubeconfig string, context string) (*rest.Config, error) {
+	loader := &clientcmd.ClientConfigLoadingRules{Precedence: filepath.SplitList(kubeconfig)}
+	loadedConfig, err := loader.Load()
+	if err != nil {
+		return nil, err
+	}
+
+	if context == "" {
+		context = loadedConfig.CurrentContext
+	}
+	klog.Infof("Use context %v", context)
+
+	return clientcmd.NewNonInteractiveClientConfig(
+		*loadedConfig,
+		context,
+		&clientcmd.ConfigOverrides{},
+		loader,
+	).ClientConfig()
+}
+
+// SetClusterRegion sets .Spec.Region field for Cluster object.
+func SetClusterRegion(c client.Client, clusterName string, regionName string) error {
+	return wait.PollUntilContextTimeout(context.TODO(), 2*time.Second, 10*time.Second, true, func(ctx context.Context) (done bool, err error) {
+		clusterObj := &clusterv1alpha1.Cluster{}
+		if err := c.Get(ctx, client.ObjectKey{Name: clusterName}, clusterObj); err != nil {
+			return false, err
+		}
+
+		clusterObj.Spec.Region = regionName
+		if err := c.Update(ctx, clusterObj); err != nil {
+			if apierrors.IsConflict(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		return true, nil
+	})
+}
+
+// UpdateClusterStatusCondition updates the target cluster status condition.
+func UpdateClusterStatusCondition(client karmada.Interface, clusterName string, condition metav1.Condition) {
+	gomega.Eventually(func() (bool, error) {
+		cluster, err := client.ClusterV1alpha1().Clusters().Get(context.TODO(), clusterName, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+
+		meta.SetStatusCondition(&cluster.Status.Conditions, condition)
+		_, err = client.ClusterV1alpha1().Clusters().UpdateStatus(context.TODO(), cluster, metav1.UpdateOptions{})
+		if err != nil {
+			return false, err
+		}
+		return true, nil
 	}, pollTimeout, pollInterval).Should(gomega.Equal(true))
 }

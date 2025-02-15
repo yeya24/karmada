@@ -1,3 +1,19 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package core
 
 import (
@@ -14,12 +30,16 @@ import (
 	"github.com/karmada-io/karmada/pkg/scheduler/framework"
 	"github.com/karmada-io/karmada/pkg/scheduler/framework/runtime"
 	"github.com/karmada-io/karmada/pkg/scheduler/metrics"
-	"github.com/karmada-io/karmada/pkg/util"
 )
 
 // ScheduleAlgorithm is the interface that should be implemented to schedule a resource to the target clusters.
 type ScheduleAlgorithm interface {
-	Schedule(context.Context, *policyv1alpha1.Placement, *workv1alpha2.ResourceBindingSpec) (scheduleResult ScheduleResult, err error)
+	Schedule(context.Context, *workv1alpha2.ResourceBindingSpec, *workv1alpha2.ResourceBindingStatus, *ScheduleAlgorithmOption) (scheduleResult ScheduleResult, err error)
+}
+
+// ScheduleAlgorithmOption represents the option for ScheduleAlgorithm.
+type ScheduleAlgorithmOption struct {
+	EnableEmptyWorkloadPropagation bool
 }
 
 // ScheduleResult includes the clusters selected.
@@ -35,40 +55,59 @@ type genericScheduler struct {
 // NewGenericScheduler creates a genericScheduler object.
 func NewGenericScheduler(
 	schedCache cache.Cache,
-	plugins []string,
-) ScheduleAlgorithm {
+	registry runtime.Registry,
+) (ScheduleAlgorithm, error) {
+	f, err := runtime.NewFramework(registry)
+	if err != nil {
+		return nil, err
+	}
 	return &genericScheduler{
 		schedulerCache:    schedCache,
-		scheduleFramework: runtime.NewFramework(plugins),
-	}
+		scheduleFramework: f,
+	}, nil
 }
 
-func (g *genericScheduler) Schedule(ctx context.Context, placement *policyv1alpha1.Placement, spec *workv1alpha2.ResourceBindingSpec) (result ScheduleResult, err error) {
+func (g *genericScheduler) Schedule(
+	ctx context.Context,
+	spec *workv1alpha2.ResourceBindingSpec,
+	status *workv1alpha2.ResourceBindingStatus,
+	scheduleAlgorithmOption *ScheduleAlgorithmOption,
+) (result ScheduleResult, err error) {
 	clusterInfoSnapshot := g.schedulerCache.Snapshot()
-	if clusterInfoSnapshot.NumOfClusters() == 0 {
-		return result, fmt.Errorf("no clusters available to schedule")
+	feasibleClusters, diagnosis, err := g.findClustersThatFit(ctx, spec, status, &clusterInfoSnapshot)
+	if err != nil {
+		return result, fmt.Errorf("failed to find fit clusters: %w", err)
 	}
 
-	feasibleClusters, err := g.findClustersThatFit(ctx, g.scheduleFramework, placement, &spec.Resource, clusterInfoSnapshot)
-	if err != nil {
-		return result, fmt.Errorf("failed to findClustersThatFit: %v", err)
-	}
+	// Short path for case no cluster fit.
 	if len(feasibleClusters) == 0 {
-		return result, fmt.Errorf("no clusters fit")
+		return result, &framework.FitError{
+			NumAllClusters: clusterInfoSnapshot.NumOfClusters(),
+			Diagnosis:      diagnosis,
+		}
 	}
-	klog.V(4).Infof("feasible clusters found: %v", feasibleClusters)
+	klog.V(4).Infof("Feasible clusters found: %v", feasibleClusters)
 
-	clustersScore, err := g.prioritizeClusters(ctx, g.scheduleFramework, placement, feasibleClusters)
+	clustersScore, err := g.prioritizeClusters(ctx, g.scheduleFramework, spec, feasibleClusters)
 	if err != nil {
-		return result, fmt.Errorf("failed to prioritizeClusters: %v", err)
+		return result, fmt.Errorf("failed to prioritize clusters: %w", err)
 	}
-	klog.V(4).Infof("feasible clusters scores: %v", clustersScore)
+	klog.V(4).Infof("Feasible clusters scores: %v", clustersScore)
 
-	clusters := g.selectClusters(clustersScore, placement.SpreadConstraints, feasibleClusters)
-
-	clustersWithReplicas, err := g.assignReplicas(clusters, placement.ReplicaScheduling, spec)
+	clusters, err := g.selectClusters(clustersScore, spec.Placement, spec)
 	if err != nil {
-		return result, fmt.Errorf("failed to assignReplicas: %v", err)
+		return result, fmt.Errorf("failed to select clusters: %w", err)
+	}
+	klog.V(4).Infof("Selected clusters: %v", clusters)
+
+	clustersWithReplicas, err := g.assignReplicas(clusters, spec, status)
+	if err != nil {
+		return result, fmt.Errorf("failed to assign replicas: %w", err)
+	}
+	klog.V(4).Infof("Assigned Replicas: %v", clustersWithReplicas)
+
+	if scheduleAlgorithmOption.EnableEmptyWorkloadPropagation {
+		clustersWithReplicas = attachZeroReplicasCluster(clusters, clustersWithReplicas)
 	}
 	result.SuggestedClusters = clustersWithReplicas
 
@@ -78,41 +117,55 @@ func (g *genericScheduler) Schedule(ctx context.Context, placement *policyv1alph
 // findClustersThatFit finds the clusters that are fit for the placement based on running the filter plugins.
 func (g *genericScheduler) findClustersThatFit(
 	ctx context.Context,
-	fwk framework.Framework,
-	placement *policyv1alpha1.Placement,
-	resource *workv1alpha2.ObjectReference,
-	clusterInfo *cache.Snapshot) ([]*clusterv1alpha1.Cluster, error) {
-	defer metrics.ScheduleStep(metrics.ScheduleStepFilter, time.Now())
+	bindingSpec *workv1alpha2.ResourceBindingSpec,
+	bindingStatus *workv1alpha2.ResourceBindingStatus,
+	clusterInfo *cache.Snapshot,
+) ([]*clusterv1alpha1.Cluster, framework.Diagnosis, error) {
+	startTime := time.Now()
+	defer metrics.ScheduleStep(metrics.ScheduleStepFilter, startTime)
+
+	diagnosis := framework.Diagnosis{
+		ClusterToResultMap: make(framework.ClusterToResultMap),
+	}
 
 	var out []*clusterv1alpha1.Cluster
-	clusters := clusterInfo.GetReadyClusters()
+	// DO NOT filter unhealthy cluster, let users make decisions by using ClusterTolerations of Placement.
+	clusters := clusterInfo.GetClusters()
 	for _, c := range clusters {
-		if result := fwk.RunFilterPlugins(ctx, placement, resource, c.Cluster()); !result.IsSuccess() {
-			klog.V(4).Infof("cluster %q is not fit, reason: %v", c.Cluster().Name, result.AsError())
+		if result := g.scheduleFramework.RunFilterPlugins(ctx, bindingSpec, bindingStatus, c.Cluster()); !result.IsSuccess() {
+			klog.V(4).Infof("Cluster %q is not fit, reason: %v", c.Cluster().Name, result.AsError())
+			diagnosis.ClusterToResultMap[c.Cluster().Name] = result
 		} else {
 			out = append(out, c.Cluster())
 		}
 	}
 
-	return out, nil
+	return out, diagnosis, nil
 }
 
 // prioritizeClusters prioritize the clusters by running the score plugins.
 func (g *genericScheduler) prioritizeClusters(
 	ctx context.Context,
 	fwk framework.Framework,
-	placement *policyv1alpha1.Placement,
+	spec *workv1alpha2.ResourceBindingSpec,
 	clusters []*clusterv1alpha1.Cluster) (result framework.ClusterScoreList, err error) {
-	defer metrics.ScheduleStep(metrics.ScheduleStepScore, time.Now())
+	startTime := time.Now()
+	defer metrics.ScheduleStep(metrics.ScheduleStepScore, startTime)
 
-	scoresMap, err := fwk.RunScorePlugins(ctx, placement, clusters)
-	if err != nil {
-		return result, err
+	scoresMap, runScorePluginsResult := fwk.RunScorePlugins(ctx, spec, clusters)
+	if runScorePluginsResult != nil {
+		return result, runScorePluginsResult.AsError()
+	}
+
+	if klog.V(4).Enabled() {
+		for plugin, nodeScoreList := range scoresMap {
+			klog.Infof("Plugin %s scores on %v/%v => %v", plugin, spec.Resource.Namespace, spec.Resource.Name, nodeScoreList)
+		}
 	}
 
 	result = make(framework.ClusterScoreList, len(clusters))
 	for i := range clusters {
-		result[i] = framework.ClusterScore{Name: clusters[i].Name, Score: 0}
+		result[i] = framework.ClusterScore{Cluster: clusters[i], Score: 0}
 		for j := range scoresMap {
 			result[i].Score += scoresMap[j][i].Score
 		}
@@ -121,126 +174,12 @@ func (g *genericScheduler) prioritizeClusters(
 	return result, nil
 }
 
-func (g *genericScheduler) selectClusters(clustersScore framework.ClusterScoreList, spreadConstraints []policyv1alpha1.SpreadConstraint, clusters []*clusterv1alpha1.Cluster) []*clusterv1alpha1.Cluster {
-	defer metrics.ScheduleStep(metrics.ScheduleStepSelect, time.Now())
-
-	if len(spreadConstraints) != 0 {
-		return g.matchSpreadConstraints(clusters, spreadConstraints)
-	}
-
-	return clusters
+func (g *genericScheduler) selectClusters(clustersScore framework.ClusterScoreList,
+	placement *policyv1alpha1.Placement, spec *workv1alpha2.ResourceBindingSpec) ([]*clusterv1alpha1.Cluster, error) {
+	return SelectClusters(clustersScore, placement, spec)
 }
 
-func (g *genericScheduler) matchSpreadConstraints(clusters []*clusterv1alpha1.Cluster, spreadConstraints []policyv1alpha1.SpreadConstraint) []*clusterv1alpha1.Cluster {
-	state := util.NewSpreadGroup()
-	g.runSpreadConstraintsFilter(clusters, spreadConstraints, state)
-	return g.calSpreadResult(state)
-}
-
-// Now support spread by cluster. More rules will be implemented later.
-func (g *genericScheduler) runSpreadConstraintsFilter(clusters []*clusterv1alpha1.Cluster, spreadConstraints []policyv1alpha1.SpreadConstraint, spreadGroup *util.SpreadGroup) {
-	for _, spreadConstraint := range spreadConstraints {
-		spreadGroup.InitialGroupRecord(spreadConstraint)
-		if spreadConstraint.SpreadByField == policyv1alpha1.SpreadByFieldCluster {
-			g.groupByFieldCluster(clusters, spreadConstraint, spreadGroup)
-		}
-	}
-}
-
-func (g *genericScheduler) groupByFieldCluster(clusters []*clusterv1alpha1.Cluster, spreadConstraint policyv1alpha1.SpreadConstraint, spreadGroup *util.SpreadGroup) {
-	for _, cluster := range clusters {
-		clusterGroup := cluster.Name
-		spreadGroup.GroupRecord[spreadConstraint][clusterGroup] = append(spreadGroup.GroupRecord[spreadConstraint][clusterGroup], cluster)
-	}
-}
-
-func (g *genericScheduler) calSpreadResult(spreadGroup *util.SpreadGroup) []*clusterv1alpha1.Cluster {
-	// TODO: now support single spread constraint
-	if len(spreadGroup.GroupRecord) > 1 {
-		return nil
-	}
-
-	return g.chooseSpreadGroup(spreadGroup)
-}
-
-func (g *genericScheduler) chooseSpreadGroup(spreadGroup *util.SpreadGroup) []*clusterv1alpha1.Cluster {
-	var feasibleClusters []*clusterv1alpha1.Cluster
-	for spreadConstraint, clusterGroups := range spreadGroup.GroupRecord {
-		if spreadConstraint.SpreadByField == policyv1alpha1.SpreadByFieldCluster {
-			if len(clusterGroups) < spreadConstraint.MinGroups {
-				return nil
-			}
-
-			if len(clusterGroups) <= spreadConstraint.MaxGroups {
-				for _, v := range clusterGroups {
-					feasibleClusters = append(feasibleClusters, v...)
-				}
-				break
-			}
-
-			if spreadConstraint.MaxGroups > 0 && len(clusterGroups) > spreadConstraint.MaxGroups {
-				var groups []string
-				for group := range clusterGroups {
-					groups = append(groups, group)
-				}
-
-				for i := 0; i < spreadConstraint.MaxGroups; i++ {
-					feasibleClusters = append(feasibleClusters, clusterGroups[groups[i]]...)
-				}
-			}
-		}
-	}
-	return feasibleClusters
-}
-
-func (g *genericScheduler) assignReplicas(
-	clusters []*clusterv1alpha1.Cluster,
-	replicaSchedulingStrategy *policyv1alpha1.ReplicaSchedulingStrategy,
-	object *workv1alpha2.ResourceBindingSpec,
-) ([]workv1alpha2.TargetCluster, error) {
-	defer metrics.ScheduleStep(metrics.ScheduleStepAssignReplicas, time.Now())
-	if len(clusters) == 0 {
-		return nil, fmt.Errorf("no clusters available to schedule")
-	}
-	targetClusters := make([]workv1alpha2.TargetCluster, len(clusters))
-
-	if object.Replicas > 0 && replicaSchedulingStrategy != nil {
-		switch replicaSchedulingStrategy.ReplicaSchedulingType {
-		// 1. Duplicated Scheduling
-		case policyv1alpha1.ReplicaSchedulingTypeDuplicated:
-			for i, cluster := range clusters {
-				targetClusters[i] = workv1alpha2.TargetCluster{Name: cluster.Name, Replicas: object.Replicas}
-			}
-			return targetClusters, nil
-		// 2. Divided Scheduling
-		case policyv1alpha1.ReplicaSchedulingTypeDivided:
-			switch replicaSchedulingStrategy.ReplicaDivisionPreference {
-			// 2.1 Weighted Scheduling
-			case policyv1alpha1.ReplicaDivisionPreferenceWeighted:
-				// If ReplicaDivisionPreference is set to "Weighted" and WeightPreference is not set,
-				// scheduler will weight all clusters averagely.
-				if replicaSchedulingStrategy.WeightPreference == nil {
-					replicaSchedulingStrategy.WeightPreference = getDefaultWeightPreference(clusters)
-				}
-				// 2.1.1 Dynamic Weighted Scheduling (by resource)
-				if len(replicaSchedulingStrategy.WeightPreference.DynamicWeight) != 0 {
-					return divideReplicasByDynamicWeight(clusters, replicaSchedulingStrategy.WeightPreference.DynamicWeight, object)
-				}
-				// 2.1.2 Static Weighted Scheduling
-				return divideReplicasByStaticWeight(clusters, replicaSchedulingStrategy.WeightPreference.StaticWeightList, object.Replicas)
-			// 2.2 Aggregated scheduling (by resource)
-			case policyv1alpha1.ReplicaDivisionPreferenceAggregated:
-				return divideReplicasByResource(clusters, object, policyv1alpha1.ReplicaDivisionPreferenceAggregated)
-			default:
-				return nil, fmt.Errorf("undefined replica division preference: %s", replicaSchedulingStrategy.ReplicaDivisionPreference)
-			}
-		default:
-			return nil, fmt.Errorf("undefined replica scheduling type: %s", replicaSchedulingStrategy.ReplicaSchedulingType)
-		}
-	}
-
-	for i, cluster := range clusters {
-		targetClusters[i] = workv1alpha2.TargetCluster{Name: cluster.Name}
-	}
-	return targetClusters, nil
+func (g *genericScheduler) assignReplicas(clusters []*clusterv1alpha1.Cluster, spec *workv1alpha2.ResourceBindingSpec,
+	status *workv1alpha2.ResourceBindingStatus) ([]workv1alpha2.TargetCluster, error) {
+	return AssignReplicas(clusters, spec, status)
 }

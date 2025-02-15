@@ -1,29 +1,79 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package app
 
 import (
 	"context"
-	"flag"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
-	"strconv"
+	"time"
 
-	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
+	cliflag "k8s.io/component-base/cli/flag"
+	"k8s.io/component-base/term"
 	"k8s.io/klog/v2"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/karmada-io/karmada/cmd/descheduler/app/options"
 	"github.com/karmada-io/karmada/pkg/descheduler"
 	karmadaclientset "github.com/karmada-io/karmada/pkg/generated/clientset/versioned"
+	"github.com/karmada-io/karmada/pkg/sharedcli"
+	"github.com/karmada-io/karmada/pkg/sharedcli/klogflag"
+	"github.com/karmada-io/karmada/pkg/sharedcli/profileflag"
+	"github.com/karmada-io/karmada/pkg/util/names"
 	"github.com/karmada-io/karmada/pkg/version"
 	"github.com/karmada-io/karmada/pkg/version/sharedcommand"
+)
+
+const (
+	// ReadHeaderTimeout is the amount of time allowed to read
+	// request headers.
+	// HTTP timeouts are necessary to expire inactive connections
+	// and failing to do so might make the application vulnerable
+	// to attacks like slowloris which work by sending data very slow,
+	// which in case of no timeout will keep the connection active
+	// eventually leading to a denial-of-service (DoS) attack.
+	// References:
+	// - https://en.wikipedia.org/wiki/Slowloris_(computer_security)
+	ReadHeaderTimeout = 32 * time.Second
+	// WriteTimeout is the amount of time allowed to write the
+	// request data.
+	// HTTP timeouts are necessary to expire inactive connections
+	// and failing to do so might make the application vulnerable
+	// to attacks like slowloris which work by sending data very slow,
+	// which in case of no timeout will keep the connection active
+	// eventually leading to a denial-of-service (DoS) attack.
+	WriteTimeout = 5 * time.Minute
+	// ReadTimeout is the amount of time allowed to read
+	// response data.
+	// HTTP timeouts are necessary to expire inactive connections
+	// and failing to do so might make the application vulnerable
+	// to attacks like slowloris which work by sending data very slow,
+	// which in case of no timeout will keep the connection active
+	// eventually leading to a denial-of-service (DoS) attack.
+	ReadTimeout = 5 * time.Minute
 )
 
 // NewDeschedulerCommand creates a *cobra.Command object with default parameters
@@ -31,11 +81,11 @@ func NewDeschedulerCommand(stopChan <-chan struct{}) *cobra.Command {
 	opts := options.NewOptions()
 
 	cmd := &cobra.Command{
-		Use: "karmada-descheduler",
+		Use: names.KarmadaDeschedulerComponentName,
 		Long: `The karmada-descheduler evicts replicas from member clusters
 if they are failed to be scheduled for a period of time. It relies on 
 karmada-scheduler-estimator to get replica status.`,
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(_ *cobra.Command, _ []string) error {
 			// validate options
 			if errs := opts.Validate(); len(errs) != 0 {
 				return errs.ToAggregate()
@@ -55,20 +105,30 @@ karmada-scheduler-estimator to get replica status.`,
 		},
 	}
 
-	// Init log flags
-	// TODO(@RainbowMango): Group the flags to "logs" flag set.
-	klog.InitFlags(flag.CommandLine)
+	fss := cliflag.NamedFlagSets{}
 
-	opts.AddFlags(cmd.Flags())
-	cmd.AddCommand(sharedcommand.NewCmdVersion(os.Stdout, "karmada-descheduler"))
-	cmd.Flags().AddGoFlagSet(flag.CommandLine)
+	genericFlagSet := fss.FlagSet("generic")
+	opts.AddFlags(genericFlagSet)
+
+	// Set klog flags
+	logsFlagSet := fss.FlagSet("logs")
+	klogflag.Add(logsFlagSet)
+
+	cmd.AddCommand(sharedcommand.NewCmdVersion(names.KarmadaDeschedulerComponentName))
+	cmd.Flags().AddFlagSet(genericFlagSet)
+	cmd.Flags().AddFlagSet(logsFlagSet)
+
+	cols, _, _ := term.TerminalSize(cmd.OutOrStdout())
+	sharedcli.SetUsageAndHelpFunc(cmd, fss, cols)
 	return cmd
 }
 
 func run(opts *options.Options, stopChan <-chan struct{}) error {
 	klog.Infof("karmada-descheduler version: %s", version.Get())
 	klog.Infof("Please make sure the karmada-scheduler-estimator of all member clusters has been deployed")
-	go serveHealthzAndMetrics(net.JoinHostPort(opts.BindAddress, strconv.Itoa(opts.SecurePort)))
+	serveHealthzAndMetrics(opts.HealthProbeBindAddress, opts.MetricsBindAddress)
+
+	profileflag.ListenAndServe(opts.ProfileOpts)
 
 	restConfig, err := clientcmd.BuildConfigFromFlags(opts.Master, opts.KubeConfig)
 	if err != nil {
@@ -100,7 +160,7 @@ func run(opts *options.Options, stopChan <-chan struct{}) error {
 		return fmt.Errorf("unable to get hostname: %v", err)
 	}
 	// add a uniquifier so that two processes on the same host don't accidentally both become active
-	id := hostname + "_" + uuid.New().String()
+	id := hostname + "_" + string(uuid.NewUUID())
 
 	rl, err := resourcelock.New(opts.LeaderElection.ResourceLock,
 		opts.LeaderElection.ResourceNamespace,
@@ -130,13 +190,64 @@ func run(opts *options.Options, stopChan <-chan struct{}) error {
 	return nil
 }
 
-func serveHealthzAndMetrics(address string) {
-	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+func serveHealthzAndMetrics(healthProbeBindAddress, metricsBindAddress string) {
+	if healthProbeBindAddress == metricsBindAddress {
+		if healthProbeBindAddress != "0" {
+			go serveCombined(healthProbeBindAddress)
+		}
+	} else {
+		if healthProbeBindAddress != "0" {
+			go serveHealthz(healthProbeBindAddress)
+		}
+		if metricsBindAddress != "0" {
+			go serveMetrics(metricsBindAddress)
+		}
+	}
+}
+
+func serveCombined(address string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", healthzHandler)
+	mux.Handle("/metrics", metricsHandler())
+
+	serveHTTP(address, mux, "healthz and metrics")
+}
+
+func serveHealthz(address string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", healthzHandler)
+	serveHTTP(address, mux, "healthz")
+}
+
+func serveMetrics(address string) {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", metricsHandler())
+	serveHTTP(address, mux, "metrics")
+}
+
+func healthzHandler(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
+}
+
+func metricsHandler() http.Handler {
+	return promhttp.HandlerFor(ctrlmetrics.Registry, promhttp.HandlerOpts{
+		ErrorHandling: promhttp.HTTPErrorOnError,
 	})
+}
 
-	http.Handle("/metrics", promhttp.Handler())
+func serveHTTP(address string, handler http.Handler, name string) {
+	httpServer := &http.Server{
+		Addr:              address,
+		Handler:           handler,
+		ReadHeaderTimeout: ReadHeaderTimeout,
+		WriteTimeout:      WriteTimeout,
+		ReadTimeout:       ReadTimeout,
+	}
 
-	klog.Fatal(http.ListenAndServe(address, nil))
+	klog.Infof("Starting %s server on %s", name, address)
+	if err := httpServer.ListenAndServe(); err != nil {
+		klog.Errorf("Failed to serve %s on %s: %v", name, address, err)
+		os.Exit(1)
+	}
 }

@@ -1,7 +1,22 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package util
 
 import (
-	"fmt"
 	"math"
 
 	corev1 "k8s.io/api/core/v1"
@@ -21,7 +36,7 @@ type Resource struct {
 	ScalarResources map[corev1.ResourceName]int64
 }
 
-// EmptyResource creates a empty resource object and returns.
+// EmptyResource creates an empty resource object and returns.
 func EmptyResource() *Resource {
 	return &Resource{}
 }
@@ -29,22 +44,7 @@ func EmptyResource() *Resource {
 // NewResource creates a new resource object from resource list.
 func NewResource(rl corev1.ResourceList) *Resource {
 	r := &Resource{}
-	for rName, rQuant := range rl {
-		switch rName {
-		case corev1.ResourceCPU:
-			r.MilliCPU += rQuant.MilliValue()
-		case corev1.ResourceMemory:
-			r.Memory += rQuant.Value()
-		case corev1.ResourcePods:
-			r.AllowedPodNumber += rQuant.Value()
-		case corev1.ResourceEphemeralStorage:
-			r.EphemeralStorage += rQuant.Value()
-		default:
-			if lifted.IsScalarResourceName(rName) {
-				r.AddScalar(rName, rQuant.Value())
-			}
-		}
-	}
+	r.Add(rl)
 	return r
 }
 
@@ -72,50 +72,26 @@ func (r *Resource) Add(rl corev1.ResourceList) {
 	}
 }
 
-// Sub is used to subtract two resources.
-// Return error when the minuend is less than the subtrahend.
-func (r *Resource) Sub(rl corev1.ResourceList) error {
-	for rName, rQuant := range rl {
-		switch rName {
-		case corev1.ResourceCPU:
-			cpu := rQuant.MilliValue()
-			if r.MilliCPU < cpu {
-				return fmt.Errorf("cpu difference is less than 0, remain %d, got %d", r.MilliCPU, cpu)
-			}
-			r.MilliCPU -= cpu
-		case corev1.ResourceMemory:
-			mem := rQuant.Value()
-			if r.Memory < mem {
-				return fmt.Errorf("memory difference is less than 0, remain %d, got %d", r.Memory, mem)
-			}
-			r.Memory -= mem
-		case corev1.ResourcePods:
-			pods := rQuant.Value()
-			if r.AllowedPodNumber < pods {
-				return fmt.Errorf("allowed pod difference is less than 0, remain %d, got %d", r.AllowedPodNumber, pods)
-			}
-			r.AllowedPodNumber -= pods
-		case corev1.ResourceEphemeralStorage:
-			ephemeralStorage := rQuant.Value()
-			if r.EphemeralStorage < ephemeralStorage {
-				return fmt.Errorf("allowed storage number difference is less than 0, remain %d, got %d", r.EphemeralStorage, ephemeralStorage)
-			}
-			r.EphemeralStorage -= ephemeralStorage
-		default:
-			if lifted.IsScalarResourceName(rName) {
-				rScalar, ok := r.ScalarResources[rName]
-				scalar := rQuant.Value()
-				if !ok && scalar > 0 {
-					return fmt.Errorf("scalar resources %s does not exist, got %d", rName, scalar)
-				}
-				if rScalar < scalar {
-					return fmt.Errorf("scalar resources %s difference is less than 0, remain %d, got %d", rName, rScalar, scalar)
-				}
-				r.ScalarResources[rName] = rScalar - scalar
+// SubResource is used to subtract two resources, if r < rr, set r to zero.
+func (r *Resource) SubResource(rr *Resource) *Resource {
+	if r == nil || rr == nil {
+		return r
+	}
+
+	r.MilliCPU = MaxInt64(r.MilliCPU-rr.MilliCPU, 0)
+	r.Memory = MaxInt64(r.Memory-rr.Memory, 0)
+	r.EphemeralStorage = MaxInt64(r.EphemeralStorage-rr.EphemeralStorage, 0)
+	r.AllowedPodNumber = MaxInt64(r.AllowedPodNumber-rr.AllowedPodNumber, 0)
+
+	for rrName, rrScalar := range rr.ScalarResources {
+		if lifted.IsScalarResourceName(rrName) {
+			rScalar, ok := r.ScalarResources[rrName]
+			if ok {
+				r.ScalarResources[rrName] = MaxInt64(rScalar-rrScalar, 0)
 			}
 		}
 	}
-	return nil
+	return r
 }
 
 // SetMaxResource compares with ResourceList and takes max value for each Resource.
@@ -226,33 +202,6 @@ func (r *Resource) MaxDivided(rl corev1.ResourceList) int64 {
 	return res
 }
 
-// LessEqual returns whether all dimensions of resources in r are less than or equal with that of rr.
-func (r *Resource) LessEqual(rr *Resource) bool {
-	lessEqualFunc := func(l, r int64) bool {
-		return l <= r
-	}
-
-	if !lessEqualFunc(r.MilliCPU, rr.MilliCPU) {
-		return false
-	}
-	if !lessEqualFunc(r.Memory, rr.Memory) {
-		return false
-	}
-	if !lessEqualFunc(r.EphemeralStorage, rr.EphemeralStorage) {
-		return false
-	}
-	if !lessEqualFunc(r.AllowedPodNumber, rr.AllowedPodNumber) {
-		return false
-	}
-	for rrName, rrQuant := range rr.ScalarResources {
-		rQuant := r.ScalarResources[rrName]
-		if !lessEqualFunc(rQuant, rrQuant) {
-			return false
-		}
-	}
-	return true
-}
-
 // AddPodTemplateRequest add the effective request resource of a pod template to the origin resource.
 // If pod container limits are specified, but requests are not, default requests to limits.
 // The code logic is almost the same as kubernetes.
@@ -317,9 +266,38 @@ func (r *Resource) AddResourcePods(pods int64) {
 	})
 }
 
+// Clone returns a copy of this resource.
+func (r *Resource) Clone() *Resource {
+	if r == nil {
+		return nil
+	}
+
+	res := &Resource{
+		MilliCPU:         r.MilliCPU,
+		Memory:           r.Memory,
+		AllowedPodNumber: r.AllowedPodNumber,
+		EphemeralStorage: r.EphemeralStorage,
+	}
+	if r.ScalarResources != nil {
+		res.ScalarResources = make(map[corev1.ResourceName]int64)
+		for k, v := range r.ScalarResources {
+			res.ScalarResources[k] = v
+		}
+	}
+	return res
+}
+
 // MinInt64 returns the smaller of two int64 numbers.
 func MinInt64(a, b int64) int64 {
 	if a <= b {
+		return a
+	}
+	return b
+}
+
+// MaxInt64 returns the largest of two int64 numbers.
+func MaxInt64(a, b int64) int64 {
+	if a >= b {
 		return a
 	}
 	return b

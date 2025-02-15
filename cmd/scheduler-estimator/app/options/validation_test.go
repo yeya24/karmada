@@ -1,3 +1,19 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package options
 
 import (
@@ -6,14 +22,25 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
+// a callback function to modify options
+type ModifyOptions func(option *Options)
+
+// New an Options with default parameters
+func New(modifyOptions ModifyOptions) Options {
+	option := Options{
+		ClusterName: "testCluster",
+		ServerPort:  8088,
+	}
+
+	if modifyOptions != nil {
+		modifyOptions(&option)
+	}
+	return option
+}
+
 func TestValidateKarmadaSchedulerEstimator(t *testing.T) {
 	successCases := []Options{
-		{
-			ClusterName: "testCluster",
-			BindAddress: "0.0.0.0",
-			SecurePort:  10100,
-			ServerPort:  8088,
-		},
+		New(nil),
 	}
 	for _, successCase := range successCases {
 		if errs := successCase.Validate(); len(errs) != 0 {
@@ -27,39 +54,15 @@ func TestValidateKarmadaSchedulerEstimator(t *testing.T) {
 		expectedErrs field.ErrorList
 	}{
 		"invalid ClusterName": {
-			opt: Options{
-				ClusterName: "",
-				BindAddress: "127.0.0.1",
-				SecurePort:  10100,
-				ServerPort:  8088,
-			},
+			opt: New(func(option *Options) {
+				option.ClusterName = ""
+			}),
 			expectedErrs: field.ErrorList{field.Invalid(newPath.Child("ClusterName"), "", "clusterName cannot be empty")},
 		},
-		"invalid BindAddress": {
-			opt: Options{
-				ClusterName: "testCluster",
-				BindAddress: "127.0.0.1:8082",
-				SecurePort:  10100,
-				ServerPort:  8088,
-			},
-			expectedErrs: field.ErrorList{field.Invalid(newPath.Child("BindAddress"), "127.0.0.1:8082", "not a valid textual representation of an IP address")},
-		},
-		"invalid SecurePort": {
-			opt: Options{
-				ClusterName: "testCluster",
-				BindAddress: "127.0.0.1",
-				SecurePort:  908188,
-				ServerPort:  8088,
-			},
-			expectedErrs: field.ErrorList{field.Invalid(newPath.Child("SecurePort"), 908188, "must be a valid port between 0 and 65535 inclusive")},
-		},
 		"invalid ServerPort": {
-			opt: Options{
-				ClusterName: "testCluster",
-				BindAddress: "127.0.0.1",
-				SecurePort:  9089,
-				ServerPort:  80888,
-			},
+			opt: New(func(option *Options) {
+				option.ServerPort = 80888
+			}),
 			expectedErrs: field.ErrorList{field.Invalid(newPath.Child("ServerPort"), 80888, "must be a valid port between 0 and 65535 inclusive")},
 		},
 	}

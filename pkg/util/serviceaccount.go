@@ -1,3 +1,19 @@
+/*
+Copyright 2020 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package util
 
 import (
@@ -75,7 +91,7 @@ func EnsureServiceAccountExist(client kubeclient.Interface, serviceAccountObj *c
 // WaitForServiceAccountSecretCreation wait the ServiceAccount's secret has been created.
 func WaitForServiceAccountSecretCreation(client kubeclient.Interface, asObj *corev1.ServiceAccount) (*corev1.Secret, error) {
 	var clusterSecret *corev1.Secret
-	err := wait.Poll(1*time.Second, 30*time.Second, func() (done bool, err error) {
+	err := wait.PollUntilContextTimeout(context.TODO(), 1*time.Second, 30*time.Second, false, func(context.Context) (done bool, err error) {
 		serviceAccount, err := client.CoreV1().ServiceAccounts(asObj.Namespace).Get(context.TODO(), asObj.Name, metav1.GetOptions{})
 		if err != nil {
 			if apierrors.IsNotFound(err) {
@@ -83,14 +99,26 @@ func WaitForServiceAccountSecretCreation(client kubeclient.Interface, asObj *cor
 			}
 			return false, fmt.Errorf("failed to retrieve service account(%s/%s) from cluster, err: %v", asObj.Namespace, asObj.Name, err)
 		}
-		clusterSecret, err = GetTargetSecret(client, serviceAccount.Secrets, corev1.SecretTypeServiceAccountToken, asObj.Namespace)
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return false, nil
+		clusterSecret, err = GetSecret(client, serviceAccount.Namespace, serviceAccount.Name)
+		if apierrors.IsNotFound(err) {
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: serviceAccount.Namespace,
+					Name:      serviceAccount.Name,
+					Annotations: map[string]string{
+						corev1.ServiceAccountNameKey: serviceAccount.Name,
+					},
+				},
+				Type: corev1.SecretTypeServiceAccountToken,
 			}
+			clusterSecret, err = CreateSecret(client, secret)
+		}
+		if err != nil {
 			return false, err
 		}
-
+		if _, ok := clusterSecret.Data["token"]; !ok {
+			return false, nil // wait for the token controller to populate the Data["token"] field
+		}
 		return true, nil
 	})
 	if err != nil {

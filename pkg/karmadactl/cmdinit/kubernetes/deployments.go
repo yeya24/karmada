@@ -1,7 +1,24 @@
+/*
+Copyright 2021 The Karmada Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package kubernetes
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -9,33 +26,39 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 
 	"github.com/karmada-io/karmada/pkg/karmadactl/cmdinit/options"
+	globaloptions "github.com/karmada-io/karmada/pkg/karmadactl/options"
+	"github.com/karmada-io/karmada/pkg/karmadactl/util"
+	"github.com/karmada-io/karmada/pkg/util/names"
 )
 
 const (
-	deploymentAPIVersion                                        = "apps/v1"
-	deploymentKind                                              = "Deployment"
-	portName                                                    = "server"
-	kubeConfigSecretAndMountName                                = "kubeconfig"
-	karmadaCertsName                                            = "karmada-cert"
-	karmadaCertsVolumeMountPath                                 = "/etc/kubernetes/pki"
-	kubeConfigContainerMountPath                                = "/etc/kubeconfig"
+	deploymentAPIVersion = "apps/v1"
+	deploymentKind       = "Deployment"
+	portName             = "server"
+	metricsPortName      = "metrics"
+	defaultMetricsPort   = 8080
+
+	karmadaCertsVolumeMountPath                                 = "/etc/karmada/pki"
+	karmadaConfigVolumeName                                     = "karmada-config"
+	karmadaConfigVolumeMountPath                                = "/etc/karmada/config"
 	karmadaAPIServerDeploymentAndServiceName                    = "karmada-apiserver"
 	karmadaAPIServerContainerPort                               = 5443
 	serviceClusterIP                                            = "10.96.0.0/12"
 	kubeControllerManagerClusterRoleAndDeploymentAndServiceName = "kube-controller-manager"
 	kubeControllerManagerPort                                   = 10257
-	schedulerDeploymentNameAndServiceAccountName                = "karmada-scheduler"
-	controllerManagerDeploymentAndServiceName                   = "karmada-controller-manager"
+	schedulerDeploymentNameAndServiceAccountName                = names.KarmadaSchedulerComponentName
+	controllerManagerDeploymentAndServiceName                   = names.KarmadaControllerManagerComponentName
 	controllerManagerSecurePort                                 = 10357
-	webhookDeploymentAndServiceAccountAndServiceName            = "karmada-webhook"
+	webhookDeploymentAndServiceAccountAndServiceName            = names.KarmadaWebhookComponentName
 	webhookCertsName                                            = "karmada-webhook-cert"
 	webhookCertVolumeMountPath                                  = "/var/serving-cert"
 	webhookPortName                                             = "webhook"
 	webhookTargetPort                                           = 8443
 	webhookPort                                                 = 443
-	karmadaAggregatedAPIServerDeploymentAndServiceName          = "karmada-aggregated-apiserver"
+	karmadaAggregatedAPIServerDeploymentAndServiceName          = names.KarmadaAggregatedAPIServerComponentName
 )
 
 var (
@@ -50,33 +73,32 @@ var (
 func (i *CommandInitOption) etcdServers() string {
 	etcdClusterConfig := ""
 	for v := int32(0); v < i.EtcdReplicas; v++ {
-		etcdClusterConfig += fmt.Sprintf("https://%s-%v.%s.%s.svc.cluster.local:%v", etcdStatefulSetAndServiceName, v, etcdStatefulSetAndServiceName, i.Namespace, etcdContainerClientPort) + ","
+		etcdClusterConfig += fmt.Sprintf("https://%s-%v.%s.%s.svc.%s:%v", etcdStatefulSetAndServiceName, v, etcdStatefulSetAndServiceName, i.Namespace, i.HostClusterDomain, etcdContainerClientPort) + ","
 	}
 	return etcdClusterConfig
 }
 
 func (i *CommandInitOption) karmadaAPIServerContainerCommand() []string {
-	return []string{
+	var etcdServers string
+	if etcdServers = i.ExternalEtcdServers; etcdServers == "" {
+		etcdServers = strings.TrimRight(i.etcdServers(), ",")
+	}
+	command := []string{
 		"kube-apiserver",
 		"--allow-privileged=true",
 		"--authorization-mode=Node,RBAC",
-		fmt.Sprintf("--client-ca-file=%s/%s.crt", karmadaCertsVolumeMountPath, options.CaCertAndKeyName),
-		"--enable-admission-plugins=NodeRestriction",
+		fmt.Sprintf("--client-ca-file=%s/%s.crt", karmadaCertsVolumeMountPath, globaloptions.CaCertAndKeyName),
 		"--enable-bootstrap-token-auth=true",
-		fmt.Sprintf("--etcd-cafile=%s/%s.crt", karmadaCertsVolumeMountPath, options.CaCertAndKeyName),
+		fmt.Sprintf("--etcd-cafile=%s/%s.crt", karmadaCertsVolumeMountPath, options.EtcdCaCertAndKeyName),
 		fmt.Sprintf("--etcd-certfile=%s/%s.crt", karmadaCertsVolumeMountPath, options.EtcdClientCertAndKeyName),
 		fmt.Sprintf("--etcd-keyfile=%s/%s.key", karmadaCertsVolumeMountPath, options.EtcdClientCertAndKeyName),
-		fmt.Sprintf("--etcd-servers=%s", strings.TrimRight(i.etcdServers(), ",")),
+		fmt.Sprintf("--etcd-servers=%s", etcdServers),
 		"--bind-address=0.0.0.0",
-		"--insecure-port=0",
-		fmt.Sprintf("--kubelet-client-certificate=%s/%s.crt", karmadaCertsVolumeMountPath, options.KarmadaCertAndKeyName),
-		fmt.Sprintf("--kubelet-client-key=%s/%s.key", karmadaCertsVolumeMountPath, options.KarmadaCertAndKeyName),
-		"--kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname",
 		"--disable-admission-plugins=StorageObjectInUseProtection,ServiceAccount",
 		"--runtime-config=",
 		fmt.Sprintf("--apiserver-count=%v", i.KarmadaAPIServerReplicas),
 		fmt.Sprintf("--secure-port=%v", karmadaAPIServerContainerPort),
-		"--service-account-issuer=https://kubernetes.default.svc.cluster.local",
+		fmt.Sprintf("--service-account-issuer=https://kubernetes.default.svc.%s", i.HostClusterDomain),
 		fmt.Sprintf("--service-account-key-file=%s/%s.key", karmadaCertsVolumeMountPath, options.KarmadaCertAndKeyName),
 		fmt.Sprintf("--service-account-signing-key-file=%s/%s.key", karmadaCertsVolumeMountPath, options.KarmadaCertAndKeyName),
 		fmt.Sprintf("--service-cluster-ip-range=%s", serviceClusterIP),
@@ -87,9 +109,14 @@ func (i *CommandInitOption) karmadaAPIServerContainerCommand() []string {
 		"--requestheader-extra-headers-prefix=X-Remote-Extra-",
 		"--requestheader-group-headers=X-Remote-Group",
 		"--requestheader-username-headers=X-Remote-User",
-		fmt.Sprintf("--tls-cert-file=%s/%s.crt", karmadaCertsVolumeMountPath, options.KarmadaCertAndKeyName),
-		fmt.Sprintf("--tls-private-key-file=%s/%s.key", karmadaCertsVolumeMountPath, options.KarmadaCertAndKeyName),
+		fmt.Sprintf("--tls-cert-file=%s/%s.crt", karmadaCertsVolumeMountPath, options.ApiserverCertAndKeyName),
+		fmt.Sprintf("--tls-private-key-file=%s/%s.key", karmadaCertsVolumeMountPath, options.ApiserverCertAndKeyName),
+		"--tls-min-version=VersionTLS13",
 	}
+	if i.ExternalEtcdKeyPrefix != "" {
+		command = append(command, fmt.Sprintf("--etcd-prefix=%s", i.ExternalEtcdKeyPrefix))
+	}
+	return command
 }
 
 func (i *CommandInitOption) makeKarmadaAPIServerDeployment() *appsv1.Deployment {
@@ -106,7 +133,7 @@ func (i *CommandInitOption) makeKarmadaAPIServerDeployment() *appsv1.Deployment 
 	}
 
 	// Probes
-	livenesProbe := &corev1.Probe{
+	livenessProbe := &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			HTTPGet: &corev1.HTTPGetAction{
 				Path: "/livez",
@@ -121,7 +148,7 @@ func (i *CommandInitOption) makeKarmadaAPIServerDeployment() *appsv1.Deployment 
 		PeriodSeconds:       30,
 		TimeoutSeconds:      5,
 	}
-	readinesProbe := &corev1.Probe{
+	readinessProbe := &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
 			HTTPGet: &corev1.HTTPGetAction{
 				Path: "/readyz",
@@ -137,6 +164,8 @@ func (i *CommandInitOption) makeKarmadaAPIServerDeployment() *appsv1.Deployment 
 	}
 
 	podSpec := corev1.PodSpec{
+		ImagePullSecrets:  i.getImagePullSecrets(),
+		PriorityClassName: i.KarmadaAPIServerPriorityClass,
 		Affinity: &corev1.Affinity{
 			PodAntiAffinity: &corev1.PodAntiAffinity{
 				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
@@ -155,10 +184,11 @@ func (i *CommandInitOption) makeKarmadaAPIServerDeployment() *appsv1.Deployment 
 				},
 			},
 		},
+		AutomountServiceAccountToken: ptr.To[bool](false),
 		Containers: []corev1.Container{
 			{
 				Name:    karmadaAPIServerDeploymentAndServiceName,
-				Image:   i.KarmadaAPIServerImage,
+				Image:   i.kubeAPIServerImage(),
 				Command: i.karmadaAPIServerContainerCommand(),
 				Ports: []corev1.ContainerPort{
 					{
@@ -169,21 +199,21 @@ func (i *CommandInitOption) makeKarmadaAPIServerDeployment() *appsv1.Deployment 
 				},
 				VolumeMounts: []corev1.VolumeMount{
 					{
-						Name:      karmadaCertsName,
+						Name:      globaloptions.KarmadaCertsName,
 						ReadOnly:  true,
 						MountPath: karmadaCertsVolumeMountPath,
 					},
 				},
-				LivenessProbe:  livenesProbe,
-				ReadinessProbe: readinesProbe,
+				LivenessProbe:  livenessProbe,
+				ReadinessProbe: readinessProbe,
 			},
 		},
 		Volumes: []corev1.Volume{
 			{
-				Name: karmadaCertsName,
+				Name: globaloptions.KarmadaCertsName,
 				VolumeSource: corev1.VolumeSource{
 					Secret: &corev1.SecretVolumeSource{
-						SecretName: karmadaCertsName,
+						SecretName: globaloptions.KarmadaCertsName,
 					},
 				},
 			},
@@ -231,7 +261,26 @@ func (i *CommandInitOption) makeKarmadaKubeControllerManagerDeployment() *appsv1
 		},
 	}
 
+	// Probes
+	livenessProbe := &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path: "/healthz",
+				Port: intstr.IntOrString{
+					IntVal: 10257,
+				},
+				Scheme: corev1.URISchemeHTTPS,
+			},
+		},
+		InitialDelaySeconds: 10,
+		FailureThreshold:    8,
+		PeriodSeconds:       10,
+		TimeoutSeconds:      15,
+	}
+
 	podSpec := corev1.PodSpec{
+		ImagePullSecrets:  i.getImagePullSecrets(),
+		PriorityClassName: i.KubeControllerManagerPriorityClass,
 		Affinity: &corev1.Affinity{
 			PodAntiAffinity: &corev1.PodAntiAffinity{
 				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
@@ -250,33 +299,34 @@ func (i *CommandInitOption) makeKarmadaKubeControllerManagerDeployment() *appsv1
 				},
 			},
 		},
+		AutomountServiceAccountToken: ptr.To[bool](false),
 		Containers: []corev1.Container{
 			{
 				Name:  kubeControllerManagerClusterRoleAndDeploymentAndServiceName,
-				Image: i.KubeControllerManagerImage,
+				Image: i.kubeControllerManagerImage(),
 				Command: []string{
 					"kube-controller-manager",
 					"--allocate-node-cidrs=true",
-					"--authentication-kubeconfig=/etc/kubeconfig",
-					"--authorization-kubeconfig=/etc/kubeconfig",
+					fmt.Sprintf("--kubeconfig=%s", filepath.Join(karmadaConfigVolumeMountPath, util.KarmadaConfigFieldName)),
+					fmt.Sprintf("--authentication-kubeconfig=%s", filepath.Join(karmadaConfigVolumeMountPath, util.KarmadaConfigFieldName)),
+					fmt.Sprintf("--authorization-kubeconfig=%s", filepath.Join(karmadaConfigVolumeMountPath, util.KarmadaConfigFieldName)),
 					"--bind-address=0.0.0.0",
-					fmt.Sprintf("--client-ca-file=%s/%s.crt", karmadaCertsVolumeMountPath, options.CaCertAndKeyName),
+					fmt.Sprintf("--client-ca-file=%s/%s.crt", karmadaCertsVolumeMountPath, globaloptions.CaCertAndKeyName),
 					"--cluster-cidr=10.244.0.0/16",
 					fmt.Sprintf("--cluster-name=%s", options.ClusterName),
-					fmt.Sprintf("--cluster-signing-cert-file=%s/%s.crt", karmadaCertsVolumeMountPath, options.CaCertAndKeyName),
-					fmt.Sprintf("--cluster-signing-key-file=%s/%s.key", karmadaCertsVolumeMountPath, options.CaCertAndKeyName),
-					"--controllers=namespace,garbagecollector,serviceaccount-token",
-					"--kubeconfig=/etc/kubeconfig",
+					fmt.Sprintf("--cluster-signing-cert-file=%s/%s.crt", karmadaCertsVolumeMountPath, globaloptions.CaCertAndKeyName),
+					fmt.Sprintf("--cluster-signing-key-file=%s/%s.key", karmadaCertsVolumeMountPath, globaloptions.CaCertAndKeyName),
+					"--controllers=namespace,garbagecollector,serviceaccount-token,ttl-after-finished,bootstrapsigner,tokencleaner,csrcleaner,csrsigning,clusterrole-aggregation",
 					"--leader-elect=true",
 					fmt.Sprintf("--leader-elect-resource-namespace=%s", i.Namespace),
 					"--node-cidr-mask-size=24",
-					"--port=0",
-					fmt.Sprintf("--root-ca-file=%s/%s.crt", karmadaCertsVolumeMountPath, options.CaCertAndKeyName),
+					fmt.Sprintf("--root-ca-file=%s/%s.crt", karmadaCertsVolumeMountPath, globaloptions.CaCertAndKeyName),
 					fmt.Sprintf("--service-account-private-key-file=%s/%s.key", karmadaCertsVolumeMountPath, options.KarmadaCertAndKeyName),
 					fmt.Sprintf("--service-cluster-ip-range=%s", serviceClusterIP),
 					"--use-service-account-credentials=true",
 					"--v=4",
 				},
+				LivenessProbe: livenessProbe,
 				Ports: []corev1.ContainerPort{
 					{
 						Name:          portName,
@@ -286,13 +336,12 @@ func (i *CommandInitOption) makeKarmadaKubeControllerManagerDeployment() *appsv1
 				},
 				VolumeMounts: []corev1.VolumeMount{
 					{
-						Name:      kubeConfigSecretAndMountName,
+						Name:      karmadaConfigVolumeName,
 						ReadOnly:  true,
-						MountPath: kubeConfigContainerMountPath,
-						SubPath:   kubeConfigSecretAndMountName,
+						MountPath: karmadaConfigVolumeMountPath,
 					},
 					{
-						Name:      karmadaCertsName,
+						Name:      globaloptions.KarmadaCertsName,
 						ReadOnly:  true,
 						MountPath: karmadaCertsVolumeMountPath,
 					},
@@ -301,18 +350,18 @@ func (i *CommandInitOption) makeKarmadaKubeControllerManagerDeployment() *appsv1
 		},
 		Volumes: []corev1.Volume{
 			{
-				Name: kubeConfigSecretAndMountName,
+				Name: karmadaConfigVolumeName,
 				VolumeSource: corev1.VolumeSource{
 					Secret: &corev1.SecretVolumeSource{
-						SecretName: kubeConfigSecretAndMountName,
+						SecretName: util.KarmadaConfigName(names.KubeControllerManagerComponentName),
 					},
 				},
 			},
 			{
-				Name: karmadaCertsName,
+				Name: globaloptions.KarmadaCertsName,
 				VolumeSource: corev1.VolumeSource{
 					Secret: &corev1.SecretVolumeSource{
-						SecretName: karmadaCertsName,
+						SecretName: globaloptions.KarmadaCertsName,
 					},
 				},
 			},
@@ -358,7 +407,26 @@ func (i *CommandInitOption) makeKarmadaSchedulerDeployment() *appsv1.Deployment 
 		},
 	}
 
+	// Probes
+	livenessProbe := &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path: "/healthz",
+				Port: intstr.IntOrString{
+					IntVal: 10351,
+				},
+				Scheme: corev1.URISchemeHTTP,
+			},
+		},
+		InitialDelaySeconds: 15,
+		FailureThreshold:    3,
+		PeriodSeconds:       15,
+		TimeoutSeconds:      5,
+	}
+
 	podSpec := corev1.PodSpec{
+		ImagePullSecrets:  i.getImagePullSecrets(),
+		PriorityClassName: i.KarmadaSchedulerPriorityClass,
 		Affinity: &corev1.Affinity{
 			PodAntiAffinity: &corev1.PodAntiAffinity{
 				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
@@ -379,35 +447,58 @@ func (i *CommandInitOption) makeKarmadaSchedulerDeployment() *appsv1.Deployment 
 		},
 		Containers: []corev1.Container{
 			{
-				Name:  schedulerDeploymentNameAndServiceAccountName,
-				Image: i.KarmadaSchedulerImage,
+				Name:            schedulerDeploymentNameAndServiceAccountName,
+				Image:           i.karmadaSchedulerImage(),
+				ImagePullPolicy: corev1.PullPolicy(i.ImagePullPolicy),
 				Command: []string{
 					"/bin/karmada-scheduler",
-					"--kubeconfig=/etc/kubeconfig",
-					"--bind-address=0.0.0.0",
-					"--secure-port=10351",
-					"--feature-gates=Failover=true",
+					fmt.Sprintf("--kubeconfig=%s", filepath.Join(karmadaConfigVolumeMountPath, util.KarmadaConfigFieldName)),
+					"--metrics-bind-address=0.0.0.0:8080",
+					"--health-probe-bind-address=0.0.0.0:10351",
 					"--enable-scheduler-estimator=true",
 					"--leader-elect=true",
+					"--scheduler-estimator-ca-file=/etc/karmada/pki/ca.crt",
+					"--scheduler-estimator-cert-file=/etc/karmada/pki/karmada.crt",
+					"--scheduler-estimator-key-file=/etc/karmada/pki/karmada.key",
 					fmt.Sprintf("--leader-elect-resource-namespace=%s", i.Namespace),
 					"--v=4",
 				},
+				LivenessProbe: livenessProbe,
+				Ports: []corev1.ContainerPort{
+					{
+						Name:          metricsPortName,
+						ContainerPort: 8080,
+						Protocol:      corev1.ProtocolTCP,
+					},
+				},
 				VolumeMounts: []corev1.VolumeMount{
 					{
-						Name:      kubeConfigSecretAndMountName,
+						Name:      karmadaConfigVolumeName,
 						ReadOnly:  true,
-						MountPath: kubeConfigContainerMountPath,
-						SubPath:   kubeConfigSecretAndMountName,
+						MountPath: karmadaConfigVolumeMountPath,
+					},
+					{
+						Name:      globaloptions.KarmadaCertsName,
+						ReadOnly:  true,
+						MountPath: karmadaCertsVolumeMountPath,
 					},
 				},
 			},
 		},
 		Volumes: []corev1.Volume{
 			{
-				Name: kubeConfigSecretAndMountName,
+				Name: karmadaConfigVolumeName,
 				VolumeSource: corev1.VolumeSource{
 					Secret: &corev1.SecretVolumeSource{
-						SecretName: kubeConfigSecretAndMountName,
+						SecretName: util.KarmadaConfigName(names.KarmadaSchedulerComponentName),
+					},
+				},
+			},
+			{
+				Name: globaloptions.KarmadaCertsName,
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{
+						SecretName: globaloptions.KarmadaCertsName,
 					},
 				},
 			},
@@ -418,7 +509,7 @@ func (i *CommandInitOption) makeKarmadaSchedulerDeployment() *appsv1.Deployment 
 				Operator: corev1.TolerationOpExists,
 			},
 		},
-		ServiceAccountName: schedulerDeploymentNameAndServiceAccountName,
+		AutomountServiceAccountToken: ptr.To[bool](false),
 	}
 
 	// PodTemplateSpec
@@ -456,7 +547,25 @@ func (i *CommandInitOption) makeKarmadaControllerManagerDeployment() *appsv1.Dep
 		},
 	}
 
+	livenessProbe := &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path: "/healthz",
+				Port: intstr.IntOrString{
+					IntVal: 10357,
+				},
+				Scheme: corev1.URISchemeHTTP,
+			},
+		},
+		InitialDelaySeconds: 15,
+		FailureThreshold:    3,
+		PeriodSeconds:       15,
+		TimeoutSeconds:      5,
+	}
+
 	podSpec := corev1.PodSpec{
+		ImagePullSecrets:  i.getImagePullSecrets(),
+		PriorityClassName: i.KarmadaControllerManagerPriorityClass,
 		Affinity: &corev1.Affinity{
 			PodAntiAffinity: &corev1.PodAntiAffinity{
 				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
@@ -477,39 +586,46 @@ func (i *CommandInitOption) makeKarmadaControllerManagerDeployment() *appsv1.Dep
 		},
 		Containers: []corev1.Container{
 			{
-				Name:  controllerManagerDeploymentAndServiceName,
-				Image: i.KarmadaControllerManagerImage,
+				Name:            controllerManagerDeploymentAndServiceName,
+				Image:           i.karmadaControllerManagerImage(),
+				ImagePullPolicy: corev1.PullPolicy(i.ImagePullPolicy),
 				Command: []string{
 					"/bin/karmada-controller-manager",
-					"--kubeconfig=/etc/kubeconfig",
-					"--bind-address=0.0.0.0",
+					fmt.Sprintf("--kubeconfig=%s", filepath.Join(karmadaConfigVolumeMountPath, util.KarmadaConfigFieldName)),
+					"--metrics-bind-address=:8080",
+					"--health-probe-bind-address=0.0.0.0:10357",
 					"--cluster-status-update-frequency=10s",
-					"--secure-port=10357",
+					fmt.Sprintf("--leader-elect-resource-namespace=%s", i.Namespace),
 					"--v=4",
 				},
+				LivenessProbe: livenessProbe,
 				Ports: []corev1.ContainerPort{
 					{
 						Name:          portName,
 						ContainerPort: controllerManagerSecurePort,
 						Protocol:      corev1.ProtocolTCP,
 					},
+					{
+						Name:          metricsPortName,
+						ContainerPort: defaultMetricsPort,
+						Protocol:      corev1.ProtocolTCP,
+					},
 				},
 				VolumeMounts: []corev1.VolumeMount{
 					{
-						Name:      kubeConfigSecretAndMountName,
+						Name:      karmadaConfigVolumeName,
 						ReadOnly:  true,
-						MountPath: kubeConfigContainerMountPath,
-						SubPath:   kubeConfigSecretAndMountName,
+						MountPath: karmadaConfigVolumeMountPath,
 					},
 				},
 			},
 		},
 		Volumes: []corev1.Volume{
 			{
-				Name: kubeConfigSecretAndMountName,
+				Name: karmadaConfigVolumeName,
 				VolumeSource: corev1.VolumeSource{
 					Secret: &corev1.SecretVolumeSource{
-						SecretName: kubeConfigSecretAndMountName,
+						SecretName: util.KarmadaConfigName(names.KarmadaControllerManagerComponentName),
 					},
 				},
 			},
@@ -520,7 +636,7 @@ func (i *CommandInitOption) makeKarmadaControllerManagerDeployment() *appsv1.Dep
 				Operator: corev1.TolerationOpExists,
 			},
 		},
-		ServiceAccountName: controllerManagerDeploymentAndServiceName,
+		AutomountServiceAccountToken: ptr.To[bool](false),
 	}
 
 	// PodTemplateSpec
@@ -557,7 +673,22 @@ func (i *CommandInitOption) makeKarmadaWebhookDeployment() *appsv1.Deployment {
 		},
 	}
 
+	// Probes
+	readinesProbe := &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path: "/readyz",
+				Port: intstr.IntOrString{
+					IntVal: webhookTargetPort,
+				},
+				Scheme: corev1.URISchemeHTTPS,
+			},
+		},
+	}
+
 	podSpec := corev1.PodSpec{
+		ImagePullSecrets:  i.getImagePullSecrets(),
+		PriorityClassName: i.KarmadaWebhookPriorityClass,
 		Affinity: &corev1.Affinity{
 			PodAntiAffinity: &corev1.PodAntiAffinity{
 				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
@@ -576,14 +707,17 @@ func (i *CommandInitOption) makeKarmadaWebhookDeployment() *appsv1.Deployment {
 				},
 			},
 		},
+		AutomountServiceAccountToken: ptr.To[bool](false),
 		Containers: []corev1.Container{
 			{
-				Name:  webhookDeploymentAndServiceAccountAndServiceName,
-				Image: i.KarmadaWebhookImage,
+				Name:            webhookDeploymentAndServiceAccountAndServiceName,
+				Image:           i.karmadaWebhookImage(),
+				ImagePullPolicy: corev1.PullPolicy(i.ImagePullPolicy),
 				Command: []string{
 					"/bin/karmada-webhook",
-					"--kubeconfig=/etc/kubeconfig",
+					fmt.Sprintf("--kubeconfig=%s", filepath.Join(karmadaConfigVolumeMountPath, util.KarmadaConfigFieldName)),
 					"--bind-address=0.0.0.0",
+					"--metrics-bind-address=:8080",
 					fmt.Sprintf("--secure-port=%v", webhookTargetPort),
 					fmt.Sprintf("--cert-dir=%s", webhookCertVolumeMountPath),
 					"--v=4",
@@ -594,13 +728,17 @@ func (i *CommandInitOption) makeKarmadaWebhookDeployment() *appsv1.Deployment {
 						ContainerPort: webhookTargetPort,
 						Protocol:      corev1.ProtocolTCP,
 					},
+					{
+						Name:          metricsPortName,
+						ContainerPort: defaultMetricsPort,
+						Protocol:      corev1.ProtocolTCP,
+					},
 				},
 				VolumeMounts: []corev1.VolumeMount{
 					{
-						Name:      kubeConfigSecretAndMountName,
+						Name:      karmadaConfigVolumeName,
 						ReadOnly:  true,
-						MountPath: kubeConfigContainerMountPath,
-						SubPath:   kubeConfigSecretAndMountName,
+						MountPath: karmadaConfigVolumeMountPath,
 					},
 					{
 						Name:      webhookCertsName,
@@ -608,25 +746,15 @@ func (i *CommandInitOption) makeKarmadaWebhookDeployment() *appsv1.Deployment {
 						MountPath: webhookCertVolumeMountPath,
 					},
 				},
-				ReadinessProbe: &corev1.Probe{
-					ProbeHandler: corev1.ProbeHandler{
-						HTTPGet: &corev1.HTTPGetAction{
-							Path: "/readyz",
-							Port: intstr.IntOrString{
-								IntVal: webhookTargetPort,
-							},
-							Scheme: corev1.URISchemeHTTPS,
-						},
-					},
-				},
+				ReadinessProbe: readinesProbe,
 			},
 		},
 		Volumes: []corev1.Volume{
 			{
-				Name: kubeConfigSecretAndMountName,
+				Name: karmadaConfigVolumeName,
 				VolumeSource: corev1.VolumeSource{
 					Secret: &corev1.SecretVolumeSource{
-						SecretName: kubeConfigSecretAndMountName,
+						SecretName: util.KarmadaConfigName(names.KarmadaWebhookComponentName),
 					},
 				},
 			},
@@ -681,7 +809,62 @@ func (i *CommandInitOption) makeKarmadaAggregatedAPIServerDeployment() *appsv1.D
 		},
 	}
 
+	// Probes
+	readinesProbe := &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path: "/readyz",
+				Port: intstr.IntOrString{
+					IntVal: 443,
+				},
+				Scheme: corev1.URISchemeHTTPS,
+			},
+		},
+		InitialDelaySeconds: 1,
+		PeriodSeconds:       3,
+		TimeoutSeconds:      15,
+	}
+	livenesProbe := &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path: "/healthz",
+				Port: intstr.IntOrString{
+					IntVal: 443,
+				},
+				Scheme: corev1.URISchemeHTTPS,
+			},
+		},
+		InitialDelaySeconds: 10,
+		PeriodSeconds:       10,
+		TimeoutSeconds:      15,
+	}
+
+	var etcdServers string
+	if etcdServers = i.ExternalEtcdServers; etcdServers == "" {
+		etcdServers = strings.TrimRight(i.etcdServers(), ",")
+	}
+	command := []string{
+		"/bin/karmada-aggregated-apiserver",
+		fmt.Sprintf("--kubeconfig=%s", filepath.Join(karmadaConfigVolumeMountPath, util.KarmadaConfigFieldName)),
+		fmt.Sprintf("--authentication-kubeconfig=%s", filepath.Join(karmadaConfigVolumeMountPath, util.KarmadaConfigFieldName)),
+		fmt.Sprintf("--authorization-kubeconfig=%s", filepath.Join(karmadaConfigVolumeMountPath, util.KarmadaConfigFieldName)),
+		fmt.Sprintf("--etcd-servers=%s", etcdServers),
+		fmt.Sprintf("--etcd-cafile=%s/%s.crt", karmadaCertsVolumeMountPath, options.EtcdCaCertAndKeyName),
+		fmt.Sprintf("--etcd-certfile=%s/%s.crt", karmadaCertsVolumeMountPath, options.EtcdClientCertAndKeyName),
+		fmt.Sprintf("--etcd-keyfile=%s/%s.key", karmadaCertsVolumeMountPath, options.EtcdClientCertAndKeyName),
+		fmt.Sprintf("--tls-cert-file=%s/%s.crt", karmadaCertsVolumeMountPath, options.KarmadaCertAndKeyName),
+		fmt.Sprintf("--tls-private-key-file=%s/%s.key", karmadaCertsVolumeMountPath, options.KarmadaCertAndKeyName),
+		"--tls-min-version=VersionTLS13",
+		"--audit-log-path=-",
+		"--audit-log-maxage=0",
+		"--audit-log-maxbackup=0",
+	}
+	if i.ExternalEtcdKeyPrefix != "" {
+		command = append(command, fmt.Sprintf("--etcd-prefix=%s", i.ExternalEtcdKeyPrefix))
+	}
 	podSpec := corev1.PodSpec{
+		ImagePullSecrets:  i.getImagePullSecrets(),
+		PriorityClassName: i.KarmadaAggregatedAPIServerPriorityClass,
 		Affinity: &corev1.Affinity{
 			PodAntiAffinity: &corev1.PodAntiAffinity{
 				RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
@@ -700,61 +883,48 @@ func (i *CommandInitOption) makeKarmadaAggregatedAPIServerDeployment() *appsv1.D
 				},
 			},
 		},
+		AutomountServiceAccountToken: ptr.To[bool](false),
 		Containers: []corev1.Container{
 			{
-				Name:  karmadaAggregatedAPIServerDeploymentAndServiceName,
-				Image: i.KarmadaAggregatedAPIServerImage,
-				Command: []string{
-					"/bin/karmada-aggregated-apiserver",
-					"--kubeconfig=/etc/kubeconfig",
-					"--authentication-kubeconfig=/etc/kubeconfig",
-					"--authorization-kubeconfig=/etc/kubeconfig",
-					"--karmada-config=/etc/kubeconfig",
-					fmt.Sprintf("--etcd-servers=%s", strings.TrimRight(i.etcdServers(), ",")),
-					fmt.Sprintf("--etcd-cafile=%s/%s.crt", karmadaCertsVolumeMountPath, options.CaCertAndKeyName),
-					fmt.Sprintf("--etcd-certfile=%s/%s.crt", karmadaCertsVolumeMountPath, options.EtcdClientCertAndKeyName),
-					fmt.Sprintf("--etcd-keyfile=%s/%s.key", karmadaCertsVolumeMountPath, options.EtcdClientCertAndKeyName),
-					fmt.Sprintf("--tls-cert-file=%s/%s.crt", karmadaCertsVolumeMountPath, options.KarmadaCertAndKeyName),
-					fmt.Sprintf("--tls-private-key-file=%s/%s.key", karmadaCertsVolumeMountPath, options.KarmadaCertAndKeyName),
-					"--audit-log-path=-",
-					"--feature-gates=APIPriorityAndFairness=false",
-					"--audit-log-maxage=0",
-					"--audit-log-maxbackup=0",
-				},
-				VolumeMounts: []corev1.VolumeMount{
-					{
-						Name:      kubeConfigSecretAndMountName,
-						ReadOnly:  true,
-						MountPath: kubeConfigContainerMountPath,
-						SubPath:   kubeConfigSecretAndMountName,
-					},
-					{
-						Name:      karmadaCertsName,
-						ReadOnly:  true,
-						MountPath: karmadaCertsVolumeMountPath,
-					},
-				},
+				Name:            karmadaAggregatedAPIServerDeploymentAndServiceName,
+				Image:           i.karmadaAggregatedAPIServerImage(),
+				ImagePullPolicy: corev1.PullPolicy(i.ImagePullPolicy),
+				Command:         command,
+				ReadinessProbe:  readinesProbe,
+				LivenessProbe:   livenesProbe,
 				Resources: corev1.ResourceRequirements{
 					Requests: corev1.ResourceList{
 						corev1.ResourceCPU: resource.MustParse("100m"),
+					},
+				},
+				VolumeMounts: []corev1.VolumeMount{
+					{
+						Name:      karmadaConfigVolumeName,
+						ReadOnly:  true,
+						MountPath: karmadaConfigVolumeMountPath,
+					},
+					{
+						Name:      globaloptions.KarmadaCertsName,
+						ReadOnly:  true,
+						MountPath: karmadaCertsVolumeMountPath,
 					},
 				},
 			},
 		},
 		Volumes: []corev1.Volume{
 			{
-				Name: kubeConfigSecretAndMountName,
+				Name: karmadaConfigVolumeName,
 				VolumeSource: corev1.VolumeSource{
 					Secret: &corev1.SecretVolumeSource{
-						SecretName: kubeConfigSecretAndMountName,
+						SecretName: util.KarmadaConfigName(names.KarmadaAggregatedAPIServerComponentName),
 					},
 				},
 			},
 			{
-				Name: karmadaCertsName,
+				Name: globaloptions.KarmadaCertsName,
 				VolumeSource: corev1.VolumeSource{
 					Secret: &corev1.SecretVolumeSource{
-						SecretName: karmadaCertsName,
+						SecretName: globaloptions.KarmadaCertsName,
 					},
 				},
 			},
